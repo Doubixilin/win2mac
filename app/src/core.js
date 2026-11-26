@@ -8,6 +8,8 @@ const https = require('https');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
+const { pipeline } = require('stream/promises');
 
 const CHUNK = 8 * 2 ** 20;
 const RETRIES = 6;
@@ -22,23 +24,111 @@ function safeName(name) {
   let s = String(name).replace(/[<>:"|?*\u0000-\u001f\\/]/g, '_').replace(/[. ]+$/g, '');
   if (!s) s = '_';
   if (WIN_RESERVED.test(s)) s = '_' + s;
-  return s.slice(0, 200);
+  let short = '', bytes = 0;
+  for (const char of s) {
+    bytes += Buffer.byteLength(char);
+    if (bytes > 240 || short.length + char.length > 200) break;
+    short += char;
+  }
+  return short.replace(/[. ]+$/g, '') || '_';
 }
 
-function safeRel(rel) {
-  const parts = String(rel).split(/[\\/]+/).filter((p) => p && p !== '.' && p !== '..').map(safeName);
+function relativeParts(rel) {
+  const parts = String(rel).split(/[\\/]+/).filter((p) => p && p !== '.' && p !== '..');
   return parts.length ? parts : ['_'];
 }
 
-/** 目标目录下若已有同名项，返回 "名字 (2).ext" 这样的不冲突名字 */
-async function uniqueName(dir, name, taken) {
+function safeRel(rel) { return relativeParts(rel).map(safeName); }
+
+function nameKey(name) { return name.normalize('NFC').toLowerCase(); }
+function numberedName(name, i) {
+  if (i === 1) return name;
   const ext = path.extname(name);
-  const base = name.slice(0, name.length - ext.length);
+  return name.slice(0, name.length - ext.length) + ' (' + i + ')' + ext;
+}
+
+async function uniqueName(dir, name, taken) {
   for (let i = 1; ; i++) {
-    const cand = i === 1 ? name : `${base} (${i})${ext}`;
-    if (taken?.has(cand.toLowerCase())) continue;
-    try { await fsp.lstat(path.join(dir, cand)); } catch { return cand; }
+    const cand = numberedName(name, i);
+    if (taken?.has(nameKey(cand))) continue;
+    try { await fsp.lstat(path.join(dir, cand)); }
+    catch (e) { if (e.code === 'ENOENT') return cand; throw e; }
   }
+}
+
+// 在目标文件系统上发布已写完的文件。硬链接的创建本身就是排他操作。
+// FAT/exFAT 等不支持硬链接的卷使用排他复制，仍然保留同时出现的已有目标。
+async function publishFile(part, dest, overwrite = false) {
+  if (overwrite) return fsp.rename(part, dest);
+  try { await fsp.link(part, dest); }
+  catch (e) {
+    if (!['ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EPERM', 'EXDEV'].includes(e.code)) throw e;
+    await fsp.copyFile(part, dest, fs.constants.COPYFILE_EXCL);
+  }
+}
+
+async function publishBatch(dir, item, stage, checkActive) {
+  const dirs = new Map(), taken = new Map(), tops = new Set(), created = [];
+  async function claim(parent, raw, create, isDir) {
+    if (!taken.has(parent)) taken.set(parent, new Set());
+    const used = taken.get(parent);
+    const name = safeName(raw);
+    for (let i = 1; ; i++) {
+      checkActive();
+      const candidate = numberedName(name, i);
+      const key = nameKey(candidate);
+      if (used.has(key)) continue;
+      const target = path.join(parent, candidate);
+      try { await create(target); }
+      catch (e) {
+        if (e.code === 'EEXIST') continue;
+        // Windows 和不支持硬链接的卷可能对已存在的目录返回 EPERM/EISDIR。
+        if (['EPERM', 'EISDIR', 'EACCES', 'ENOTEMPTY'].includes(e.code) && await fsp.lstat(target).catch(() => null)) continue;
+        throw e;
+      }
+      used.add(key);
+      const identity = await fsp.lstat(target, { bigint: true });
+      created.push({ target, isDir, identity });
+      if (parent === dir) tops.add(target);
+      return target;
+    }
+  }
+  async function directory(parts) {
+    let parent = dir;
+    for (const raw of parts) {
+      // 保留原始路径分量身份，清洗后同名的两个目录各自占一个名字。
+      const key = path.join(parent, raw);
+      if (!dirs.has(key)) dirs.set(key, await claim(parent, raw, (p) => fsp.mkdir(p), true));
+      parent = dirs.get(key);
+    }
+    return parent;
+  }
+  try {
+    for (const [i, f] of item.files.entries()) {
+      const parts = relativeParts(f.rel);
+      const raw = parts.pop();
+      const parent = await directory(parts);
+      await claim(parent, raw, (p) => publishFile(path.join(stage, String(i)), p), false);
+    }
+    for (const rel of item.dirs || []) await directory(relativeParts(rel));
+    checkActive();
+    return [...tops];
+  } catch (e) {
+    for (const { target, isDir, identity } of created.reverse()) {
+      // 保留已经替换或编辑过的文件。目录已被外部添加内容时 rmdir 会保留它。
+      const current = await fsp.lstat(target, { bigint: true }).catch(() => null);
+      if (!current || current.dev !== identity.dev || current.ino !== identity.ino) continue;
+      if (!isDir && current.mtimeNs !== identity.mtimeNs) continue;
+      await (isDir ? fsp.rmdir(target) : fsp.unlink(target)).catch(() => {});
+    }
+    throw e;
+  }
+}
+
+async function fileDigest(file) {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
 }
 
 class Canceled extends Error { constructor() { super('已取消'); this.canceled = true; } }
@@ -60,12 +150,25 @@ class Relay extends EventEmitter {
     this._inQ = Promise.resolve();
     this._outQ = Promise.resolve();
     this._agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
-    this.configure(opts || {});
-  }
-
-  configure(opts) {
     Object.assign(this.opts, opts);
     this.opts.server = String(this.opts.server || '').trim().replace(/\/+$/, '');
+    this._retired = false;
+  }
+
+  updatePreferences({ deviceName, downloadDir }) {
+    Object.assign(this.opts, { deviceName, downloadDir });
+  }
+
+  // 每个 Relay 固定绑定一组服务器与凭据。切换配对会退役旧实例并创建新实例。
+  retire() {
+    this._retired = true;
+    this.stop();
+    this._destroyAgents();
+  }
+
+  _checkActive(id) {
+    if (this._retired) throw new Error('配对已切换，传输已中断');
+    if (this._canceled.has(id)) throw new Canceled();
   }
 
   get configured() { return !!(this.opts.server && this.opts.token && this.opts.deviceId); }
@@ -99,6 +202,7 @@ class Relay extends EventEmitter {
   // ---------- HTTP 基础 ----------
 
   _request(method, p, { headers = {}, signalId } = {}) {
+    this._checkActive(signalId);
     const url = new URL(this.opts.server + p);
     const mod = url.protocol === 'https:' ? https : http;
     const req = mod.request(url, {
@@ -145,13 +249,17 @@ class Relay extends EventEmitter {
   async _retry(id, fn) {
     let lastErr;
     for (let i = 0; i < RETRIES; i++) {
-      if (this._canceled.has(id)) throw new Canceled();
-      try { return await fn(i); } catch (e) {
-        if (this._canceled.has(id)) throw new Canceled();
+      this._checkActive(id);
+      try {
+        const result = await fn(i);
+        this._checkActive(id);
+        return result;
+      } catch (e) {
+        this._checkActive(id);
         // 4xx（除 408/409/429）是确定性错误，重试没有意义
         if (e.status && e.status >= 400 && e.status < 500 && ![408, 409, 429].includes(e.status)) throw e;
         lastErr = e;
-        await sleep(Math.min(1000 * 2 ** i, 15e3));
+        if (i + 1 < RETRIES) await sleep(Math.min(1000 * 2 ** i, 15e3));
       }
     }
     throw lastErr;
@@ -235,9 +343,9 @@ class Relay extends EventEmitter {
     } else if (event === 'item') {
       if (this._seen.has(data.id)) return;
       this._seen.add(data.id);
-      this._inQ = this._inQ.then(() => this._receive(data)).catch((e) => this.emit('warn', e));
-    } else if (event === 'delivered') {
-      this.emit('delivered', data);
+      this._inQ = this._inQ.then(() => { if (!this._retired) return this._receive(data); }).catch((e) => this.emit('warn', e));
+    } else if (event === 'delivered' || event === 'declined') {
+      this.emit(event, data);
     } else if (event === 'rpc' || event === 'rpc-reply') {
       this.emit(event, data);
     }
@@ -299,6 +407,7 @@ class Relay extends EventEmitter {
   }
 
   async _upload(entry, paths, clip) {
+    this._checkActive(entry.id);
     const { files, dirs } = await this._scan(paths);
     if (!files.length && !dirs.length) throw new Error('没有可发送的文件');
     entry.total = files.reduce((n, f) => n + f.size, 0);
@@ -376,49 +485,38 @@ class Relay extends EventEmitter {
       await this._ack(item.id);
       return;
     }
-    const tops = [...new Set([...item.files.map((f) => safeRel(f.rel)[0]), ...(item.dirs || []).map((d) => safeRel(d)[0])])];
+    const tops = [...new Set([...item.files.map((f) => f.rel), ...(item.dirs || [])].map((rel) => relativeParts(rel)[0]))].map(safeName);
     const entry = this._entry({
       ...common, kind: 'files', state: 'active', total: item.total, done: 0, paths: [],
       name: tops.length === 1 ? tops[0] : `${tops[0]} 等 ${tops.length} 项`, count: tops.length, fileCount: item.files.length,
     });
     this.emit('entry', entry);
+    let stage;
     try {
       const dir = this.opts.downloadDir;
       await fsp.mkdir(dir, { recursive: true });
-      // 顶层名字若与已有文件冲突，整体换一个名字，内部结构保持不变
-      const map = new Map(), taken = new Set();
-      for (const t of tops) {
-        const u = await uniqueName(dir, t, taken);
-        taken.add(u.toLowerCase());
-        map.set(t, u);
-      }
-      const dest = (rel) => { const parts = safeRel(rel); parts[0] = map.get(parts[0]); return path.join(dir, ...parts); };
-      entry.paths = tops.map((t) => path.join(dir, map.get(t)));
-
-      for (const d of item.dirs || []) await fsp.mkdir(dest(d), { recursive: true });
+      stage = await fsp.mkdtemp(path.join(dir, '.win2mac-'));
       let base = 0;
-      for (let i = 0; i < item.files.length; i++) {
-        const f = item.files[i];
-        const target = dest(f.rel);
-        await fsp.mkdir(path.dirname(target), { recursive: true });
-        const part = target + '.w2mpart';
-        await fsp.rm(part, { force: true });
+      for (const [i, f] of item.files.entries()) {
+        const part = path.join(stage, String(i));
         await this._retry(entry.id, () => this._download(entry, item.id, i, f.size, part, base));
-        await fsp.rename(part, target);
         base += f.size;
         this._progress(entry, base);
       }
+      entry.paths = await publishBatch(dir, item, stage, () => this._checkActive(entry.id));
       this._finish(entry, 'done');
       this.emit('received', entry, item);
       await this._ack(item.id);
     } catch (e) {
       this._fail(entry, e);
-      if (e.canceled) await this._ack(item.id); // 主动取消等于拒收，不再重投
-      else this._seen.delete(item.id); // 失败的下次重连时服务器会再推一次
+      if (e.canceled && !this._retired) await this._ack(item.id, 'declined');
+      else this._seen.delete(item.id);
+    } finally {
+      if (stage) await fsp.rm(stage, { recursive: true, force: true }).catch((e) => this.emit('warn', e));
     }
   }
 
-  /** 支持断点续传：.w2mpart 已有多少就从多少开始 */
+  /** 支持断点续传：按本任务暂存文件的长度继续下载。 */
   async _download(entry, rid, idx, size, part, progressBase) {
     let have = 0;
     try { have = (await fsp.stat(part)).size; } catch {}
@@ -428,8 +526,10 @@ class Relay extends EventEmitter {
       const req = this._request('GET', `/api/items/${rid}/files/${idx}`, {
         signalId: entry.id, headers: have ? { Range: `bytes=${have}-` } : {},
       });
-      req.on('error', reject);
+      let responseStarted = false;
+      req.on('error', (e) => { if (!responseStarted) reject(e); });
       req.on('response', (res) => {
+        responseStarted = true;
         if (res.statusCode !== 200 && res.statusCode !== 206) {
           res.resume();
           return reject(Object.assign(new Error(`下载失败 ${res.statusCode}`), { status: res.statusCode }));
@@ -439,18 +539,19 @@ class Relay extends EventEmitter {
         const ws = fs.createWriteStream(part, { flags: append ? 'a' : 'w' });
         let got = have;
         res.on('data', (c) => { got += c.length; this._progress(entry, progressBase + got); });
-        res.on('error', (e) => { ws.destroy(); reject(e); });
-        res.on('aborted', () => { ws.destroy(); reject(new Error('连接中断')); });
-        ws.on('error', (e) => { req.destroy(); reject(e); });
-        ws.on('finish', () => (got === size ? resolve() : reject(new Error('文件不完整'))));
-        res.pipe(ws);
+        pipeline(res, ws).then(() => {
+          if (got === size) resolve();
+          else reject(new Error('文件不完整'));
+        }, reject);
       });
       req.end();
     });
   }
 
-  async _ack(rid) {
-    try { await this._retry('ack', () => this._json('POST', `/api/items/${rid}/ack`)); }
+  async _ack(rid, status) {
+    // 独立路由使旧中转即使不认识拒收，也不会错误地产生已送达回执。
+    const action = status === 'declined' ? 'decline' : 'ack';
+    try { await this._retry('ack', () => this._json('POST', `/api/items/${rid}/${action}`)); }
     catch (e) { if (e.status !== 404) this.emit('warn', e); }
   }
 
@@ -463,6 +564,7 @@ class Relay extends EventEmitter {
   async uploadDirect(abs, to) {
     const st = await fsp.stat(abs);
     if (!st.isFile()) throw new Error('只能传单个文件');
+    const sha256 = await fileDigest(abs);
     const tag = { id: 'direct-' + Math.random().toString(36).slice(2), total: st.size, silent: true };
     const created = await this._retry(tag.id, () => this._json('POST', '/api/items', {
       kind: 'files', direct: to, files: [{ rel: path.basename(abs), size: st.size }],
@@ -482,22 +584,24 @@ class Relay extends EventEmitter {
       this._json('DELETE', `/api/items/${created.id}`).catch(() => {});
       throw e;
     }
-    return { id: created.id, size: st.size, name: path.basename(abs) };
+    return { id: created.id, size: st.size, name: path.basename(abs), sha256 };
   }
 
   /** 取回一个定向文件，写到指定路径，取完即从中转删除 */
-  async downloadDirect(rid, size, dest) {
-    const tag = { id: 'direct-' + rid, total: size, silent: true };
-    await fsp.mkdir(path.dirname(dest), { recursive: true });
-    const part = dest + '.w2mpart';
-    await fsp.rm(part, { force: true });
+  async downloadDirect(rid, size, dest, { sha256, overwrite = false } = {}) {
+    if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('定向文件缺少有效的 SHA-256 摘要，请升级两端');
+    const tag = { id: 'direct-' + crypto.randomUUID(), total: size, silent: true };
+    const parent = path.dirname(dest);
+    await fsp.mkdir(parent, { recursive: true });
+    const stage = await fsp.mkdtemp(path.join(parent, '.win2mac-'));
+    const part = path.join(stage, 'payload');
     try {
       await this._retry(tag.id, () => this._download(tag, rid, 0, size, part, 0));
-      if (size === 0) await fsp.writeFile(part, '');
-      await fsp.rename(part, dest);
-    } catch (e) {
-      await fsp.rm(part, { force: true }).catch(() => {});
-      throw e;
+      if (await fileDigest(part) !== sha256) throw new Error('定向文件 SHA-256 校验失败');
+      this._checkActive(tag.id);
+      await publishFile(part, dest, overwrite);
+    } finally {
+      await fsp.rm(stage, { recursive: true, force: true }).catch((e) => this.emit('warn', e));
     }
     await this._ack(rid);
   }
@@ -536,6 +640,7 @@ class Relay extends EventEmitter {
   _fail(entry, e) {
     entry.state = e?.canceled || this._canceled.has(entry.id) ? 'canceled' : 'error';
     entry.error = entry.state === 'canceled' ? '已取消' : (e?.message || '失败');
+    this._canceled.delete(entry.id);
     this.emit('entry', entry);
   }
 }

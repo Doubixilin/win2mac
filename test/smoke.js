@@ -1,9 +1,9 @@
 'use strict';
 // 真机冒烟测试：启动真正的 Electron 应用，对端用一个 Node Relay 模拟。
 // 用法（在 app 目录下）：npx electron ../test/smoke.js <输出目录>
-// 会短暂占用系统剪贴板（结束时恢复原来的文字）。
+// 会短暂占用系统剪贴板（结束时恢复原来的条目和格式）。
 
-const { app, clipboard, nativeImage } = require('electron');
+const { app, clipboard, ClipboardItem, nativeImage } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const assert = require('assert');
 const crypto = require('crypto');
@@ -19,8 +19,11 @@ const SERVER = `http://127.0.0.1:${PORT}`;
 const dirs = { data: `${ROOT}/data`, user: `${ROOT}/user`, recv: `${ROOT}/recv`, peer: `${ROOT}/peer`, src: `${ROOT}/src` };
 for (const d of [...Object.values(dirs), OUT]) fs.mkdirSync(d, { recursive: true });
 
+const deviceId = 'smoke-' + crypto.randomUUID();
+const { generateKeys } = require('../app/src/control');
+const originalIdentity = generateKeys();
 fs.writeFileSync(path.join(dirs.user, 'config.json'), JSON.stringify({
-  server: SERVER, token: TOKEN, deviceId: 'smoke-mac-001', deviceName: '家里Mac', downloadDir: dirs.recv,
+  server: SERVER, token: TOKEN, deviceId, keyPrivate: originalIdentity.privateKey, keyPublic: originalIdentity.publicKey, deviceName: '家里Mac', downloadDir: dirs.recv,
   notify: false, hotkey: '', openAtLogin: false, floatPos: { x: 200, y: 200 },
 }));
 process.env.W2M_USER_DATA = dirs.user;
@@ -49,7 +52,7 @@ const srv = spawn(process.execPath, [path.join(__dirname, '../server/server.js')
 });
 
 const { Relay } = require('../app/src/core.js');
-const { ControlClient, generateKeys, fingerprint } = require('../app/src/control.js');
+const { ControlClient, fingerprint } = require('../app/src/control.js');
 const main = require('../app/src/main.js');
 
 async function shot(win, name) {
@@ -68,7 +71,13 @@ async function cdpDrop(win, x, y, data) {
 }
 
 app.whenReady().then(async () => {
-  const savedClipboard = await clipboard.readText().catch(() => '');
+  const savedClipboard = [];
+  for (const item of await clipboard.read()) {
+    if (!item.types.length) continue;
+    const content = {};
+    for (const type of item.types) content[type] = await item.getType(type);
+    savedClipboard.push(new ClipboardItem(content));
+  }
   const peerKeys = generateKeys();
   const peer = new Relay({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', downloadDir: dirs.peer, publicKey: peerKeys.publicKey });
   const ctl = new ControlClient({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', publicKey: peerKeys.publicKey, privateKey: peerKeys.privateKey, pinsFile: path.join(ROOT, 'pins.json') });
@@ -91,6 +100,21 @@ app.whenReady().then(async () => {
       assert.ok(main.floatWin.isAlwaysOnTop());
       await until(() => main.relay.connected, 10e3, '连接服务器');
       await shot(main.mainWin, '1-main-alone.png');
+    });
+
+    await step('桌面端迁移已有私钥，内置 MCP 运行时能从系统凭据读取同一身份', async () => {
+      const filename = path.join(dirs.user, 'config.json');
+      const saved = JSON.parse(fs.readFileSync(filename, 'utf8'));
+      assert.equal(saved.keyPrivate, undefined);
+      assert.equal(saved.keyPublic, originalIdentity.publicKey);
+      const checkKey = [
+        "const cfg = require(process.argv[1]);",
+        "const key = require(process.argv[2]).readSigningKey(cfg);",
+        "const ctl = require(process.argv[3]);",
+        "if (!ctl.verifyText('migration', ctl.signText('migration', key), cfg.keyPublic)) process.exit(1);",
+      ].join('\n');
+      execFileSync(process.execPath, ['-e', checkKey, filename, require.resolve('../app/src/identity'), require.resolve('../app/src/control')],
+        { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 10000 });
     });
 
     await step('对端上线后界面显示在线', async () => {
@@ -227,6 +251,11 @@ app.whenReady().then(async () => {
       await until(() => main.config.controllers['smoke-win-001']?.level === 'read', 5e3, '授权生效');
       const info = await ctl.call('家里Mac', 'sys.info');
       assert.equal(info.home, os.homedir());
+      const settings = path.join(dirs.user, 'config.json');
+      await assert.rejects(ctl.call('家里Mac', 'fs.read', { path: settings }), { code: 'protected-file' });
+      const target = path.join(dirs.peer, 'forbidden-copy');
+      await assert.rejects(ctl.pullFile('家里Mac', settings, target), { code: 'protected-file' });
+      assert.ok(!fs.existsSync(target));
       await clipboard.writeText('被控端剪贴板内容');
       assert.equal((await ctl.call('家里Mac', 'clipboard.read')).text, '被控端剪贴板内容');
       await assert.rejects(ctl.call('家里Mac', 'exec', { command: 'echo no' }), (e) => e.code === 'read-only');
@@ -271,6 +300,26 @@ app.whenReady().then(async () => {
       assert.deepEqual(main.floatWin.getBounds(), { x: 200, y: 200, width: 76, height: 76 });
     });
 
+    await step('从设置页切换配对会中断旧队列，重新配对后可正常发送', async () => {
+      const old = main.relay;
+      let release;
+      old._outQ = new Promise((resolve) => { release = resolve; });
+      const queued = old.sendText('旧配对的排队文本');
+      try {
+        await js(main.mainWin, `w2m.saveConfig({ token: 'temporary-pair-for-test' })`);
+        assert.notEqual(main.relay, old);
+      } finally {
+        release();
+        main.applyConfig({ token: TOKEN });
+      }
+      await old._outQ;
+      assert.equal(queued.state, 'error');
+      await until(() => main.relay.connected, 5e3, '恢复配对');
+      main.relay.sendText('新配对的文本');
+      await next((e) => e.text === '新配对的文本', '新配对发送');
+      assert.ok(!got.some((e) => e.text === '旧配对的排队文本'));
+    });
+
     await step('服务器断开后界面提示未连接，恢复后自动重连', async () => {
       srv.kill();
       await until(() => js(main.mainWin, `document.getElementById('peerName').textContent === '未连接服务器'`), 10e3, '未连接提示');
@@ -280,7 +329,10 @@ app.whenReady().then(async () => {
     results.push({ name: '测试框架', ok: false, error: String(e.stack || e) });
     console.log('FATAL', e);
   } finally {
-    await clipboard.writeText(savedClipboard).catch(() => {});
+    if (savedClipboard.length) await clipboard.write(savedClipboard);
+    else clipboard.clear();
+    const { Entry } = require('../app/node_modules/@napi-rs/keyring');
+    new Entry('com.doubilin.win2mac.signing', deviceId).deleteCredential();
     peer.stop();
     ctl.stop();
     srv.kill();

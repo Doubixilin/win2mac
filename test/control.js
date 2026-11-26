@@ -2,7 +2,7 @@
 // 远程控制与 MCP 的端到端测试：本地起中转服务，一端是被控主机，一端是控制端 / MCP 进程。
 // 用法：node test/control.js
 
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -18,6 +18,21 @@ const SERVER = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha = async (p) => crypto.createHash('sha256').update(await fsp.readFile(p)).digest('hex');
 const rejectsWith = (p, code) => assert.rejects(p, (e) => { assert.equal(e.code, code, `期望 ${code}，实际 ${e.code}: ${e.message}`); return true; });
+
+// 独立进程的被控宿主。应答和剪贴板都在内存中，只把去重记录写入测试目录。
+async function replayFixture() {
+  const { replayFile, request, hostKey, controllerKey } = JSON.parse(fs.readFileSync(0, 'utf8'));
+  let writes = 0, response;
+  const host = new ControlHost({
+    replayFile,
+    identity: () => ({ deviceId: 'fixture-host', privateKey: hostKey }),
+    controllers: () => ({ 'fixture-controller': { key: controllerKey, level: 'full' } }),
+    relay: { replyRpc: async (_, reply) => { response = JSON.parse(reply); } },
+    extras: { clipboardWrite: () => { writes++; return { ok: true }; } },
+  });
+  await host._handle(request);
+  process.stdout.write(JSON.stringify({ writes, error: response.error?.code || null }));
+}
 
 async function main() {
   const root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), 'w2m-ctl-')));
@@ -44,6 +59,7 @@ async function main() {
     const relay = new Relay({ server: SERVER, token: TOKEN, deviceId: HOST, deviceName: '办公 Win', downloadDir: `${root}/host-dl`, publicKey: keys.publicKey });
     const host = new ControlHost({
       relay, identity: () => ({ deviceId: HOST, privateKey: keys.privateKey }), controllers: () => controllers,
+      replayFile: path.join(dirs.cfg, 'control-replay.json'),
       onActivity: (a) => activity.push(a),
       extras: {
         clipboardRead: async () => ({ text: '主机剪贴板', files: [], hasImage: false }),
@@ -67,6 +83,38 @@ async function main() {
   const grant = (level) => { if (level) controllers[CTRL] = { name: '家里 Mac', key: ctrlKeys.publicKey, level }; else delete controllers[CTRL]; };
 
   try {
+    await step('跨重启保留有效的副作用请求编号；损坏记录时停止写操作', async () => {
+      const replayFile = path.join(dirs.work, 'replay-fixture.json');
+      const openHost = () => new ControlHost({ replayFile });
+      const ts = Date.now();
+      // 只登记请求元数据，不执行这些操作。
+      const first = { id: 'first', ts, method: 'fs.write' };
+      const second = { id: 'second', ts, method: 'fs.sendVerified' };
+      openHost()._rememberRequest(first, ts);
+      openHost()._rememberRequest(second, ts);
+      for (const req of [first, second]) {
+        assert.throws(() => openHost()._rememberRequest(req, ts), { code: 'replay' });
+      }
+      await fsp.writeFile(replayFile, 'invalid fixture');
+      assert.throws(() => openHost()._rememberRequest(first, ts), { code: 'replay-store' });
+      assert.equal(await fsp.readFile(replayFile, 'utf8'), 'invalid fixture');
+      await fsp.rm(replayFile);
+    });
+
+    await step('被控 Node 进程退出再启动后同一项剪贴板操作只执行一次', async () => {
+      const payload = JSON.stringify({
+        id: crypto.randomUUID(), from: 'fixture-controller', to: 'fixture-host', ts: Date.now(),
+        method: 'clipboard.write', params: { text: 'test' },
+      });
+      const input = JSON.stringify({
+        replayFile: path.join(dirs.cfg, 'restart-fixture.json'), hostKey: hostKeys.privateKey,
+        controllerKey: ctrlKeys.publicKey, request: { payload, sig: signText(payload, ctrlKeys.privateKey) },
+      });
+      const start = () => JSON.parse(execFileSync(process.execPath, [__filename, '--replay-fixture'], { input, encoding: 'utf8' }));
+      assert.deepEqual(start(), { writes: 1, error: null });
+      assert.deepEqual(start(), { writes: 0, error: 'replay' });
+    });
+
     await step('控制端能看到主机在线和它的公钥指纹', async () => {
       await C.ready();
       for (let i = 0; i < 50 && !C.devices().some((d) => d.online); i++) await sleep(100);
@@ -144,6 +192,19 @@ async function main() {
     });
 
     const big = path.join(dirs.local, '安装包.bin');
+    await step('旧版传输方法要求升级，缺少摘要的定向文件不落盘', async () => {
+      for (const legacy of ['fs.send', 'fs.receive']) await rejectsWith(C.call(HOST, legacy), 'upgrade-required');
+      const dest = path.join(dirs.work, '缺少摘要.bin');
+      await assert.rejects(C.call(HOST, 'fs.receiveVerified', { item: 'unused', size: 0, dest }), /SHA-256/i);
+      assert.ok(!fs.existsSync(dest));
+      // 模拟旧版本收到带校验的新方法，确保控制端不会降级为旧写入方法。
+      const called = [];
+      const offline = Object.create(ControlClient.prototype);
+      offline.call = async (_, method) => { called.push(method); throw Object.assign(new Error(), { code: 'unknown-method' }); };
+      await rejectsWith(offline.pullFile('fixture', 'file', dest), 'upgrade-required');
+      assert.deepEqual(called, ['fs.sendVerified']);
+    });
+
     await step('把本机 12MB 文件传到对方指定目录；默认不覆盖', async () => {
       await fsp.writeFile(big, crypto.randomBytes(12 * 2 ** 20 + 77));
       const r = await C.pushFile(HOST, big, dirs.work); // 目标是目录 → 保留原文件名
@@ -227,9 +288,16 @@ async function main() {
 
     // ---------- MCP 进程 ----------
     await fsp.writeFile(path.join(dirs.cfg, 'config.json'), JSON.stringify({
-      server: SERVER, token: TOKEN, deviceId: CTRL, deviceName: '家里 Mac', keyPublic: ctrlKeys.publicKey, keyPrivate: ctrlKeys.privateKey,
+      server: SERVER, token: TOKEN, deviceId: CTRL, deviceName: '家里 Mac', keyPublic: ctrlKeys.publicKey,
     }));
-    const mcp = spawn(process.execPath, [path.join(__dirname, '../app/src/mcp.js')], { env: { ...process.env, W2M_USER_DATA: dirs.cfg }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const mockCredential = path.join(dirs.cfg, 'mock-credential.cjs');
+    const keyring = require.resolve('../app/node_modules/@napi-rs/keyring');
+    await fsp.writeFile(mockCredential, `require.cache[${JSON.stringify(keyring)}] = {
+      exports: { Entry: class { getPassword() { return process.env.W2M_TEST_SIGNING_KEY; } } }
+    };`);
+    const mcp = spawn(process.execPath, ['--require', mockCredential, path.join(__dirname, '../app/src/mcp.js')], {
+      env: { ...process.env, W2M_USER_DATA: dirs.cfg, W2M_TEST_SIGNING_KEY: ctrlKeys.privateKey }, stdio: ['pipe', 'pipe', 'pipe'],
+    });
     let buf = '', nextId = 1;
     const waiting = new Map();
     mcp.stdout.on('data', (d) => {
@@ -331,4 +399,5 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+const run = process.argv[2] === '--replay-fixture' ? replayFixture : main;
+run().catch((e) => { console.error(e); process.exit(1); });

@@ -60,6 +60,14 @@ function statusText(e) {
     return ['', `${e.dir === 'out' ? '上传中' : '接收中'} ${pct}%`];
   }
   if (e.dir === 'in') return ['ok', '已接收'];
+  if (e.receipts?.length) {
+    const delivered = e.receipts.filter((r) => r.status === 'delivered').map((r) => r.name);
+    const declined = e.receipts.filter((r) => r.status === 'declined').map((r) => r.name);
+    const labels = [];
+    if (delivered.length) labels.push('已送达 ' + delivered.join('、'));
+    if (declined.length) labels.push(declined.join('、') + ' 已拒收');
+    return [declined.length ? 'err' : 'ok', labels.join('，')];
+  }
   return e.delivered ? ['ok', '已送达'] : ['', '已发出，等待对方接收'];
 }
 

@@ -24,8 +24,8 @@ const OUT_TAIL = 140 * 1024;
 const READ_MAX = 2 * 2 ** 20;
 
 /** 只读权限就能用的方法；其余都需要“完全控制” */
-const READ_METHODS = new Set(['sys.info', 'fs.list', 'fs.read', 'fs.stat', 'fs.send', 'clipboard.read', 'screen.capture']);
-const FULL_METHODS = new Set(['exec', 'fs.write', 'fs.receive', 'clipboard.write', 'open']);
+const READ_METHODS = new Set(['sys.info', 'fs.list', 'fs.read', 'fs.stat', 'fs.sendVerified', 'clipboard.read', 'screen.capture']);
+const FULL_METHODS = new Set(['exec', 'fs.write', 'fs.receiveVerified', 'clipboard.write', 'open']);
 
 // ---------- 密钥与签名 ----------
 
@@ -57,6 +57,26 @@ class ControlError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
 
+// 主进程单实例。同步登记后才允许分派，无 await 的读改写也能防止同时到达的请求互相覆盖。
+function recordSideEffect(file, id, expires, now) {
+  let entries = [];
+  try {
+    try { entries = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (!Array.isArray(entries) || !entries.every((e) => Array.isArray(e) && e.length === 2 && typeof e[0] === 'string' && Number.isFinite(e[1]))) {
+      throw new Error('记录格式无效');
+    }
+    entries = entries.filter(([, until]) => until >= now);
+    if (entries.some(([key]) => key === id)) throw new ControlError('replay', '重复的请求');
+    entries.push([id, expires]);
+    fs.writeFileSync(file + '.tmp', JSON.stringify(entries), { mode: 0o600, flush: true });
+    fs.renameSync(file + '.tmp', file);
+  } catch (e) {
+    if (e instanceof ControlError) throw e;
+    throw new ControlError('replay-store', '无法保存远程请求的防重放记录，操作已停止：' + e.message);
+  }
+}
+
 // ---------- 被控端：具体干活的函数 ----------
 
 function expand(p) {
@@ -64,6 +84,21 @@ function expand(p) {
   if (p === '~') return os.homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
   return path.resolve(os.homedir(), p); // 相对路径按用户主目录算
+}
+
+// 两种返回文件内容的入口共享此检查，用规范路径继续读，避免跟随原来的路径别名。
+async function readableRemotePath(requested, protectedDir) {
+  const [target, root] = await Promise.all([fsp.realpath(requested), fsp.realpath(protectedDir)]);
+  const relative = path.relative(root, target);
+  const deny = () => { throw new ControlError('protected-file', 'Win2Mac 的本机凭据和应用数据不允许远程读取'); };
+  if (!relative || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative))) deny();
+  // 硬链接的真实路径仍可在目录外。用文件身份识别当前凭据文件的其他名字。
+  const st = await fsp.stat(target, { bigint: true });
+  if (st.nlink > 1n) {
+    const credentials = await fsp.stat(path.join(root, 'config.json'), { bigint: true });
+    if (st.dev === credentials.dev && st.ino === credentials.ino) deny();
+  }
+  return target;
 }
 
 /** 保留开头和结尾，中间超出的部分丢掉——构建日志之类最有用的通常在两头 */
@@ -207,13 +242,21 @@ class ControlHost {
    * @param extras       { clipboardRead, clipboardWrite, screenshot, open }，由桌面宿主提供
    * @param onActivity   每次请求处理完回调一次，用来记日志、给用户看
    */
-  constructor({ relay, identity, controllers, extras = {}, onActivity = () => {} }) {
-    Object.assign(this, { relay, identity, controllers, extras, onActivity });
+  constructor({ relay, identity, controllers, replayFile, extras = {}, onActivity = () => {} }) {
+    Object.assign(this, { relay, identity, controllers, replayFile, extras, onActivity });
     this.seen = new Map(); // 请求编号 -> 时间，防重放
     this._onRpc = (msg) => this._handle(msg).catch((e) => this.relay.emit('warn', e));
   }
   attach() { this.relay.on('rpc', this._onRpc); return this; }
   detach() { this.relay.off('rpc', this._onRpc); }
+
+  _rememberRequest(req, now) {
+    for (const [id, until] of this.seen) if (until < now) this.seen.delete(id);
+    if (this.seen.has(req.id)) throw new ControlError('replay', '重复的请求');
+    const expires = req.ts + CLOCK_SKEW_MS;
+    if (FULL_METHODS.has(req.method) || req.method === 'fs.sendVerified') recordSideEffect(this.replayFile, req.id, expires, now);
+    this.seen.set(req.id, expires);
+  }
 
   async _handle(msg) {
     let req;
@@ -228,13 +271,12 @@ class ControlHost {
       if (!ctrl || !ctrl.key || !['read', 'full'].includes(ctrl.level)) throw new ControlError('forbidden', '这台设备没有授权你控制它。请到它的 Win2Mac 设置 → 远程控制 里授权。');
       if (!verifyText(msg.payload, msg.sig, ctrl.key)) throw new ControlError('bad-signature', '签名校验失败：发起方的密钥和这台设备上授权的不一致，需要重新授权。');
       if (req.to !== me.deviceId) throw new ControlError('wrong-target', '请求不是发给这台设备的');
-      if (!Number.isFinite(req.ts) || Math.abs(Date.now() - req.ts) > CLOCK_SKEW_MS) throw new ControlError('stale', '请求时间和本机时间相差太大，请检查两台电脑的系统时间');
-      if (this.seen.has(req.id)) throw new ControlError('replay', '重复的请求');
-      this.seen.set(req.id, Date.now());
-      for (const [id, t] of this.seen) if (Date.now() - t > 2 * CLOCK_SKEW_MS) this.seen.delete(id);
+      if (!Number.isFinite(req.ts) || Math.abs(t0 - req.ts) > CLOCK_SKEW_MS) throw new ControlError('stale', '请求时间和本机时间相差太大，请检查两台电脑的系统时间');
+      if (req.method === 'fs.send' || req.method === 'fs.receive') throw new ControlError('upgrade-required', '定向传文件需要双方支持 SHA-256 校验，请升级两台设备的 Win2Mac。');
       const needFull = FULL_METHODS.has(req.method);
       if (!needFull && !READ_METHODS.has(req.method)) throw new ControlError('unknown-method', `不支持的操作：${req.method}`);
       if (needFull && ctrl.level !== 'full') throw new ControlError('read-only', '这台设备只给了你只读权限，不能执行命令或修改内容');
+      this._rememberRequest(req, t0);
       result = await this._dispatch(req.method, req.params || {}, req);
     } catch (e) {
       error = { code: e.code && typeof e.code === 'string' ? e.code : 'failed', message: e.message || String(e) };
@@ -248,21 +290,24 @@ class ControlHost {
   }
 
   async _dispatch(method, params, req) {
+    if (this.extras.protectedDir && (method === 'fs.read' || method === 'fs.sendVerified')) {
+      params = { ...params, path: await readableRemotePath(expand(params.path), this.extras.protectedDir) };
+    }
     if (method === 'sys.info') return sysInfo();
     if (method === 'exec') return runCommand(params);
     if (fsMethods[method]) return fsMethods[method](params);
-    if (method === 'fs.send') {
+    if (method === 'fs.sendVerified') {
       const full = expand(params.path);
       const up = await this.relay.uploadDirect(full, req.from);
-      return { item: up.id, size: up.size, name: up.name, path: full };
+      return { item: up.id, size: up.size, sha256: up.sha256, name: up.name, path: full };
     }
-    if (method === 'fs.receive') {
+    if (method === 'fs.receiveVerified') {
       if (typeof params.item !== 'string' || !Number.isSafeInteger(params.size)) throw new ControlError('bad-params', '参数无效');
       let dest = expand(params.dest);
       const st = await fsp.stat(dest).catch(() => null);
       if (st?.isDirectory()) dest = path.join(dest, path.basename(String(params.name || 'file')));
       if (!params.overwrite && fs.existsSync(dest)) throw new ControlError('exists', `目标已存在：${dest}（需要覆盖请显式指定）`);
-      await this.relay.downloadDirect(params.item, params.size, dest);
+      await this.relay.downloadDirect(params.item, params.size, dest, { sha256: params.sha256, overwrite: params.overwrite === true });
       return { path: dest, size: params.size };
     }
     const map = { 'clipboard.read': 'clipboardRead', 'clipboard.write': 'clipboardWrite', 'screen.capture': 'screenshot', open: 'open' };
@@ -377,6 +422,15 @@ class ControlClient extends EventEmitter {
   // 传输超时按最慢 0.2MB/s 估，再留 2 分钟余量
   static transferTimeout(size) { return Math.min(120e3 + (size / (0.2 * 2 ** 20)) * 1000, 6 * 3600e3); }
 
+  // 使用独立方法名，使旧接收端在写入文件前就拒绝该请求。
+  async _verifiedTransfer(ref, method, params, timeoutMs) {
+    try { return await this.call(ref, method, params, { timeoutMs }); }
+    catch (e) {
+      if (e.code === 'unknown-method') throw new ControlError('upgrade-required', '对方尚未支持定向文件的 SHA-256 校验，请升级对方的 Win2Mac。');
+      throw e;
+    }
+  }
+
   /** 把本机文件传到对方的指定位置 */
   async pushFile(ref, localPath, remotePath, { overwrite = false } = {}) {
     await this.ready();
@@ -384,7 +438,9 @@ class ControlClient extends EventEmitter {
     const local = expand(localPath);
     const up = await this.relay.uploadDirect(local, dev.id);
     try {
-      return await this.call(dev.id, 'fs.receive', { item: up.id, size: up.size, name: up.name, dest: remotePath, overwrite }, { timeoutMs: ControlClient.transferTimeout(up.size) });
+      return await this._verifiedTransfer(dev.id, 'fs.receiveVerified', {
+        item: up.id, size: up.size, sha256: up.sha256, name: up.name, dest: remotePath, overwrite,
+      }, ControlClient.transferTimeout(up.size));
     } catch (e) {
       this.relay._json('DELETE', `/api/items/${up.id}`).catch(() => {});
       throw e;
@@ -394,14 +450,14 @@ class ControlClient extends EventEmitter {
   /** 把对方的文件取到本机的指定位置 */
   async pullFile(ref, remotePath, localPath, { overwrite = false } = {}) {
     let dest = expand(localPath);
-    const sent = await this.call(ref, 'fs.send', { path: remotePath }, { timeoutMs: 6 * 3600e3 });
+    const sent = await this._verifiedTransfer(ref, 'fs.sendVerified', { path: remotePath }, 6 * 3600e3);
     const st = await fsp.stat(dest).catch(() => null);
     if (st?.isDirectory()) dest = path.join(dest, sent.name);
     if (!overwrite && fs.existsSync(dest)) {
-      this.relay._ack(sent.item);
+      await this.relay._ack(sent.item, 'declined');
       throw new ControlError('exists', `本机目标已存在：${dest}（需要覆盖请显式指定）`);
     }
-    await this.relay.downloadDirect(sent.item, sent.size, dest);
+    await this.relay.downloadDirect(sent.item, sent.size, dest, { sha256: sent.sha256, overwrite });
     return { path: dest, size: sent.size, remotePath: sent.path };
   }
 }

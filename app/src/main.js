@@ -10,7 +10,8 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { fileURLToPath } = require('url');
 const { Relay } = require('./core');
-const { ControlHost, generateKeys, fingerprint } = require('./control');
+const { ControlHost, fingerprint } = require('./control');
+const { prepareIdentity } = require('./identity');
 
 // AI 客户端正常是用 ELECTRON_RUN_AS_NODE=1 直接跑 mcp.js 的。万一某个客户端不传环境变量，
 // 程序会被当成普通应用启动并带着 mcp.js 这个参数——这时不开窗口、不抢单实例锁，就在主进程里提供 MCP 服务。
@@ -25,6 +26,8 @@ const FLOAT_SIZE = 76;
 const HISTORY_MAX = 300;
 
 let config = null;
+let signingKey = null;
+let identityError = '';
 let history = [];
 let relay = null;
 let mainWin = null;
@@ -56,23 +59,28 @@ function readJson(p, fallback) {
 }
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p + '.tmp', JSON.stringify(data, null, 2));
+  fs.writeFileSync(p + '.tmp', JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(p + '.tmp', p);
 }
 
 function loadConfig() {
-  const saved = readJson(file('config.json'), {});
+  let saved;
+  try { saved = JSON.parse(fs.readFileSync(file('config.json'), 'utf8')); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; saved = {}; }
   config = { ...defaults(), ...saved };
-  let dirty = !saved.deviceId;
-  // 设备密钥：远程控制的请求和应答都靠它签名，私钥只留在本机
-  if (!config.keyPrivate || !config.keyPublic) {
-    const k = generateKeys();
-    config.keyPrivate = k.privateKey;
-    config.keyPublic = k.publicKey;
-    dirty = true;
-  }
   if (!config.controllers || typeof config.controllers !== 'object') config.controllers = {};
-  if (dirty) saveConfig();
+  try {
+    const identity = prepareIdentity(config);
+    if (!saved.deviceId || saved.keyPrivate || saved.keyPublic !== identity.settings.keyPublic) {
+      writeJson(file('config.json'), identity.settings);
+    }
+    config = identity.settings;
+    signingKey = identity.privateKey;
+  } catch (e) {
+    // 钥匙串锁定时保留可重试的旧配置，普通收发仍可用。
+    identityError = '远程控制暂不可用。请检查系统凭据后重启 Win2Mac。' + e.message;
+    if (!saved.deviceId) saveConfig();
+  }
 }
 function saveConfig() { writeJson(file('config.json'), config); }
 
@@ -405,7 +413,10 @@ function publicConfig() {
   return { ...rest, pairCode: pairCode(), hotkeyActive: !!activeHotkey || !config.hotkey, fingerprint: fingerprint(config.keyPublic) };
 }
 
-const relayOpts = () => ({ ...config, publicKey: config.keyPublic });
+const relayOpts = () => ({
+  server: config.server, token: config.token, deviceId: config.deviceId, deviceName: config.deviceName,
+  downloadDir: config.downloadDir, publicKey: signingKey ? config.keyPublic : '',
+});
 
 function applyLoginItem() {
   if (!app.isPackaged) return; // 开发模式下注册的是 electron 本体，没有意义
@@ -425,9 +436,12 @@ function applyConfig(patch) {
   if (config.hotkey !== before.hotkey) hotkeyOk = registerHotkey();
   if (config.openAtLogin !== before.openAtLogin) applyLoginItem();
   if (config.showFloat !== before.showFloat) setFloatVisible(config.showFloat);
-  if (['server', 'token', 'deviceName', 'downloadDir'].some((k) => config[k] !== before[k])) {
-    relay.configure(relayOpts());
-    relay.start();
+  if (config.server !== before.server || config.token !== before.token) {
+    relay.retire();
+    setupRelay();
+  } else if (config.deviceName !== before.deviceName || config.downloadDir !== before.downloadDir) {
+    relay.updatePreferences(config);
+    if (config.deviceName !== before.deviceName) relay.start();
   }
   refreshTray();
   broadcast('config', publicConfig());
@@ -500,6 +514,7 @@ function controllerList() {
 
 function setController(id, level) {
   if (level === 'none') { delete config.controllers[id]; saveConfig(); return { ok: true }; }
+  if (identityError) return { ok: false, error: identityError };
   if (!['read', 'full'].includes(level)) return { ok: false, error: '无效的权限档位' };
   const peer = relay.peers.find((p) => p.id === id);
   const prev = config.controllers[id];
@@ -515,7 +530,7 @@ function mcpConfig() {
   const command = process.execPath;
   const script = path.join(__dirname, 'mcp.js');
   const json = JSON.stringify({ mcpServers: { win2mac: { command, args: [script], env: { ELECTRON_RUN_AS_NODE: '1' } } } }, null, 2);
-  const toml = `[mcp_servers.win2mac]\ncommand = '${command}'\nargs = ['${script}']\nenv = { ELECTRON_RUN_AS_NODE = "1" }\n`;
+  const toml = require('./mcp-register').codexToml();
   return { json, toml };
 }
 
@@ -557,7 +572,7 @@ function setupIpc() {
   h('remove-entry', (id) => { history = history.filter((x) => x.id !== id); saveHistorySoon(); return true; });
   h('clear-history', () => { history = history.filter((x) => x.state === 'active'); saveHistorySoon(); return history; });
   h('cancel', (id) => { relay.cancel(id); return true; });
-  h('controllers', () => ({ list: controllerList(), fingerprint: fingerprint(config.keyPublic), log: controlLog.slice(0, 20) }));
+  h('controllers', () => ({ list: controllerList(), fingerprint: identityError || fingerprint(config.keyPublic), log: controlLog.slice(0, 20) }));
   h('set-controller', (id, level) => setController(String(id), String(level)));
   h('mcp-config', () => mcpConfig());
   h('mcp-register', () => require('./mcp-register').register());
@@ -587,18 +602,40 @@ function setupIpc() {
 function setupRelay() {
   relay = new Relay(relayOpts());
   relay.on('status', (s) => { broadcast('status', s); refreshTray(); });
-  relay.on('entry', upsertEntry);
-  relay.on('received', onReceived);
-  relay.on('delivered', ({ id, byName }) => {
-    const e = history.find((x) => x.remoteId === id);
-    if (e) upsertEntry({ ...e, delivered: true, deliveredTo: byName });
+  const earlyReceipts = new Map();
+  function withReceipt(entry, receipt) {
+    const receipts = (entry.receipts || []).filter((x) => x.by !== receipt.by);
+    return { ...entry, receipts: [...receipts, receipt] };
+  }
+  relay.on('entry', (entry) => {
+    const early = earlyReceipts.get(entry.remoteId);
+    if (early) {
+      for (const receipt of early) entry = withReceipt(entry, receipt);
+      earlyReceipts.delete(entry.remoteId);
+    }
+    upsertEntry(entry);
   });
+  relay.on('received', onReceived);
+  for (const status of ['delivered', 'declined']) {
+    relay.on(status, ({ id, by, byName }) => {
+      const receipt = { by, name: byName || by, status };
+      const entry = history.find((x) => x.dir === 'out' && x.remoteId === id);
+      if (entry) upsertEntry(withReceipt(entry, receipt));
+      // 创建请求的响应可能晚于 SSE 回执。只在确有发送项等待编号时暂存。
+      else if (history.some((x) => x.dir === 'out' && x.state === 'active' && !x.remoteId)) {
+        if (earlyReceipts.size >= HISTORY_MAX) earlyReceipts.delete(earlyReceipts.keys().next().value);
+        const receipts = earlyReceipts.get(id) || [];
+        earlyReceipts.set(id, [...receipts.filter((x) => x.by !== by), receipt]);
+      }
+    });
+  }
   relay.on('warn', (e) => console.error('relay:', e?.message || e));
-  new ControlHost({
+  if (signingKey) new ControlHost({
     relay,
-    identity: () => ({ deviceId: config.deviceId, privateKey: config.keyPrivate }),
+    identity: () => ({ deviceId: config.deviceId, privateKey: signingKey }),
+    replayFile: file('control-replay.json'),
     controllers: () => config.controllers,
-    extras: controlExtras,
+    extras: { ...controlExtras, protectedDir: app.getPath('userData') },
     onActivity: logControl,
   }).attach();
   relay.start();
@@ -623,7 +660,11 @@ if (mcpMode) {
 
   app.whenReady().then(() => {
     if (process.platform === 'win32') app.setAppUserModelId('com.doubilin.win2mac');
-    loadConfig();
+    try { loadConfig(); } catch (e) {
+      dialog.showErrorBox('无法读取 Win2Mac 配置', e.message);
+      app.exit(1);
+      return;
+    }
     loadHistory();
     Menu.setApplicationMenu(isMac ? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'windowMenu' }]) : null);
     setupRelay();

@@ -14,6 +14,8 @@ const path = require('path');
 const readline = require('readline');
 const { ControlClient, fingerprint } = require('./control');
 
+const { readSigningKey } = require('./identity');
+
 const VERSION = (() => { try { return require('../package.json').version; } catch { return '0.0.0'; } })();
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const log = (...a) => process.stderr.write('[win2mac-mcp] ' + a.join(' ') + '\n');
@@ -33,10 +35,10 @@ function getClient() {
   try { cfg = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')); }
   catch { throw new Error(`没找到 Win2Mac 的配置（${path.join(dir, 'config.json')}）。请先在这台电脑上打开 Win2Mac 并完成配对。`); }
   if (!cfg.server || !cfg.token) throw new Error('这台电脑上的 Win2Mac 还没有填服务器地址和口令。');
-  if (!cfg.keyPrivate || !cfg.keyPublic) throw new Error('这台电脑上的 Win2Mac 版本太旧，没有设备密钥。请升级并启动一次。');
+  if (!cfg.keyPublic) throw new Error('这台电脑上的 Win2Mac 版本太旧，没有设备密钥。请升级并启动一次。');
   client = new ControlClient({
     server: cfg.server, token: cfg.token, deviceId: cfg.deviceId, deviceName: cfg.deviceName,
-    publicKey: cfg.keyPublic, privateKey: cfg.keyPrivate, pinsFile: path.join(dir, 'known-devices.json'),
+    publicKey: cfg.keyPublic, privateKey: readSigningKey(cfg), pinsFile: path.join(dir, 'known-devices.json'),
   });
   client.on('warn', (e) => log('warn:', e?.message || e));
   client.start();

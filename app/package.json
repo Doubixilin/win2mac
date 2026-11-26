@@ -1,7 +1,7 @@
 {
   "name": "win2mac",
   "productName": "Win2Mac",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Drag-and-drop text, files and folders between Windows and Mac through your own relay server",
   "main": "src/main.js",
   "author": "Doubixilin",
@@ -51,6 +51,7 @@
       "runAfterFinish": true,
       "shortcutName": "Win2Mac"
     },
+    "beforeBuild": "scripts/before-build.js",
     "afterPack": "scripts/after-pack.js"
   },
   "devDependencies": {
@@ -61,5 +62,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Doubixilin/win2mac.git"
+  },
+  "dependencies": {
+    "@napi-rs/keyring": "2.1.2",
+    "toml-eslint-parser": "0.10.0"
   }
 }

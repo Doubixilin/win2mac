@@ -30,25 +30,70 @@ const BLOBS = path.join(DATA, 'blobs');
 const STATE_FILE = path.join(DATA, 'state.json');
 fs.mkdirSync(BLOBS, { recursive: true });
 
-/** @type {{devices: Record<string,{name:string,lastSeen:number}>, items: Record<string, any>}} */
-let state = { devices: {}, items: {} };
-try {
-  state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  state.devices ||= {};
-  state.items ||= {};
-} catch (e) {
-  if (e.code !== 'ENOENT') console.error('读取 state.json 失败，使用空状态：', e.message);
+const isId = (s) => typeof s === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(s);
+const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function validStoredItem(id, it) {
+  if (!isId(id) || !isRecord(it) || it.id !== id || !isId(it.from) || !Number.isFinite(it.createdAt)) return false;
+  if (it.pending !== null && !(Array.isArray(it.pending) && it.pending.every(isId))) return false;
+  if (it.kind === 'text') return it.status === 'ready' && typeof it.text === 'string';
+  return it.kind === 'files' && ['ready', 'uploading'].includes(it.status)
+    && Number.isSafeInteger(it.total) && it.total >= 0
+    && Array.isArray(it.files) && it.files.every((f) => isRecord(f) && cleanRel(f.rel) && Number.isSafeInteger(f.size) && f.size >= 0)
+    && (it.dirs === undefined || (Array.isArray(it.dirs) && it.dirs.every(cleanRel)))
+    && (it.direct === undefined || isId(it.direct));
+}
+
+function loadState() {
+  let raw;
+  try { raw = fs.readFileSync(STATE_FILE, 'utf8'); } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    if (fs.readdirSync(BLOBS).length || fs.readdirSync(DATA).some((name) => name !== 'blobs')) {
+      throw new Error('state.json 缺失，但数据目录已有内容');
+    }
+    return { devices: {}, items: {} };
+  }
+  const saved = JSON.parse(raw);
+  if (!isRecord(saved) || !isRecord(saved.devices) || !isRecord(saved.items)
+      || !Object.entries(saved.devices).every(([id, d]) => isId(id) && isRecord(d) && typeof d.name === 'string' && Number.isFinite(d.lastSeen))
+      || !Object.entries(saved.items).every(([id, it]) => validStoredItem(id, it))) {
+    throw new Error('state.json 结构无效');
+  }
+  return saved;
+}
+
+let state;
+try { state = loadState(); } catch (e) {
+  console.error('中转索引无法读取，已停止启动并保留暂存文件。请检查或恢复', STATE_FILE, e.message);
+  process.exit(1);
 }
 
 let saveTimer = null;
 function saveSoon() {
   if (saveTimer) return;
-  saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 200);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try { saveNow(); } catch (e) { console.error('保存中转状态失败', e.message); }
+  }, 200);
 }
 function saveNow() {
   const tmp = STATE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(state));
   fs.renameSync(tmp, STATE_FILE);
+  clearTimeout(saveTimer);
+  saveTimer = null;
+}
+
+// 调用者只在快照替换成功后推送事件或返回成功。失败时恢复内存，以便安全重试。
+function persistItem(id, next) {
+  const previous = state.items[id];
+  if (next) state.items[id] = next;
+  else delete state.items[id];
+  try { saveNow(); } catch (e) {
+    if (previous) state.items[id] = previous;
+    else delete state.items[id];
+    throw e;
+  }
 }
 
 /** deviceId -> Set<ServerResponse>：客户端主连接，收内容推送和远程控制请求 */
@@ -56,7 +101,6 @@ const streams = new Map();
 /** deviceId -> Set<ServerResponse>：控制端（MCP 进程）连接，只收设备列表和控制应答，不算“在线” */
 const controlStreams = new Map();
 
-const isId = (s) => typeof s === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(s);
 const newId = () => crypto.randomBytes(9).toString('base64url');
 const blobDir = (id) => path.join(BLOBS, id);
 const blobPath = (id, idx) => path.join(BLOBS, id, String(idx));
@@ -154,21 +198,19 @@ function usedBytes() {
 async function removeItem(id, notify) {
   const it = state.items[id];
   if (!it) return;
-  delete state.items[id];
-  saveSoon();
+  persistItem(id, null);
   await fsp.rm(blobDir(id), { recursive: true, force: true }).catch(() => {});
   if (notify) broadcast('gone', { id });
 }
 
 function publish(it) {
   // 定向文件（远程控制里的文件收发）：只给指定设备按编号来取，不走推送
-  if (it.direct) { it.pending = [it.direct]; it.status = 'ready'; saveSoon(); return; }
-  const others = Object.keys(state.devices).filter((d) => d !== it.from);
-  it.pending = others.length ? others : null;
-  it.status = 'ready';
-  saveSoon();
-  const pub = publicItem(it);
-  for (const id of streams.keys()) if (wants(it, id)) pushTo(id, 'item', pub);
+  const others = it.direct ? [it.direct] : Object.keys(state.devices).filter((d) => d !== it.from);
+  const ready = { ...it, pending: others.length ? others : null, status: 'ready' };
+  persistItem(it.id, ready);
+  if (ready.direct) return;
+  const pub = publicItem(ready);
+  for (const id of streams.keys()) if (wants(ready, id)) pushTo(id, 'item', pub);
 }
 
 // ---------- 路由处理 ----------
@@ -225,7 +267,6 @@ async function handleCreate(req, res, device) {
   if (body.kind === 'text') {
     if (typeof body.text !== 'string' || !body.text.length) return send(res, 400, { error: '文本为空' });
     it.text = body.text;
-    state.items[it.id] = it;
     publish(it);
     return send(res, 200, { id: it.id });
   }
@@ -246,9 +287,11 @@ async function handleCreate(req, res, device) {
     }
     if (!it.files.length && !it.dirs.length) return send(res, 400, { error: '没有可发送的内容' });
     if (usedBytes() + it.total > MAX_BYTES) return send(res, 507, { error: '服务器中转空间不足' });
-    await fsp.mkdir(blobDir(it.id), { recursive: true });
-    state.items[it.id] = it;
-    saveSoon();
+    fs.mkdirSync(blobDir(it.id));
+    try { persistItem(it.id, it); } catch (e) {
+      await fsp.rmdir(blobDir(it.id)).catch(() => {});
+      throw e;
+    }
     return send(res, 200, { id: it.id });
   }
   return send(res, 400, { error: '未知类型' });
@@ -295,7 +338,8 @@ async function handleCommit(req, res, device, it) {
     if (size === -1 && it.files[i].size === 0) { await fsp.writeFile(p, ''); size = 0; }
     if (size !== it.files[i].size) return send(res, 409, { error: '文件未传完', index: i, size: Math.max(size, 0) });
   }
-  publish(it);
+  if (state.items[it.id] === it) publish(it);
+  else if (state.items[it.id]?.status !== 'ready') return send(res, 404, { error: '条目不存在或已过期' });
   send(res, 200, { id: it.id });
 }
 
@@ -318,13 +362,14 @@ async function handleDownload(req, res, device, it, idx) {
   rs.pipe(res);
 }
 
-async function handleAck(req, res, device, it) {
+async function handleAck(res, device, it, event) {
   if (it.from === device) return send(res, 400, { error: '发送方不能确认' });
-  if (it.pending === null) it.pending = [];
-  else it.pending = it.pending.filter((d) => d !== device);
-  saveSoon();
-  pushTo(it.from, 'delivered', { id: it.id, by: device, byName: state.devices[device]?.name || device });
-  if (!it.pending.length) await removeItem(it.id, false);
+  if (it.status !== 'ready') return send(res, 409, { error: '条目未就绪' });
+  if (it.pending && !it.pending.includes(device)) return send(res, 200, { ok: true });
+  const pending = it.pending?.filter((d) => d !== device) || [];
+  if (pending.length) persistItem(it.id, { ...it, pending });
+  else await removeItem(it.id, false);
+  pushTo(it.from, event, { id: it.id, by: device, byName: state.devices[device]?.name || device });
   send(res, 200, { ok: true });
 }
 
@@ -391,7 +436,8 @@ async function route(req, res) {
     return send(res, 200, { ok: true });
   }
   if (parts[3] === 'commit' && req.method === 'POST') return handleCommit(req, res, device, it);
-  if (parts[3] === 'ack' && req.method === 'POST') return handleAck(req, res, device, it);
+  if (parts[3] === 'ack' && req.method === 'POST') return handleAck(res, device, it, 'delivered');
+  if (parts[3] === 'decline' && req.method === 'POST') return handleAck(res, device, it, 'declined');
   if (parts[3] === 'files' && /^\d+$/.test(parts[4] || '')) {
     const idx = Number(parts[4]);
     if (req.method === 'PUT') return handleUpload(req, res, device, it, idx, url);

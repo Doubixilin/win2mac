@@ -17,6 +17,27 @@ const SERVER = `http://127.0.0.1:${PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha = async (p) => crypto.createHash('sha256').update(await fsp.readFile(p)).digest('hex');
 
+function startServer(data, port = PORT) {
+  const child = spawn(process.execPath, [path.join(__dirname, '../server/server.js')], {
+    env: { ...process.env, W2M_HOST: '127.0.0.1', W2M_PORT: port, W2M_TOKEN: TOKEN, W2M_DATA: data },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.once('error', reject);
+    child.once('close', (code) => reject(new Error(`中转进程退出 ${code}: ${stderr}`)));
+    child.stdout.once('data', () => resolve(child));
+  });
+}
+
+async function stopServer(child, signal = 'SIGTERM') {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill(signal);
+  await exited;
+}
+
 function waitFor(emitter, event, pred = () => true, ms = 30e3) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => { emitter.off(event, on); reject(new Error(`等待 ${event} 超时`)); }, ms);
@@ -30,10 +51,7 @@ async function main() {
   const dirs = { data: path.join(root, 'data'), src: path.join(root, 'src'), a: path.join(root, 'recvA'), b: path.join(root, 'recvB') };
   for (const d of Object.values(dirs)) await fsp.mkdir(d, { recursive: true });
 
-  const srv = spawn(process.execPath, [path.join(__dirname, '../server/server.js')], {
-    env: { ...process.env, W2M_PORT: PORT, W2M_TOKEN: TOKEN, W2M_DATA: dirs.data }, stdio: ['ignore', 'pipe', 'inherit'],
-  });
-  await new Promise((r) => srv.stdout.once('data', r));
+  let srv = await startServer(dirs.data);
   const results = [];
   const step = async (name, fn) => {
     try { await fn(); results.push(['PASS', name]); console.log('PASS', name); }
@@ -215,20 +233,78 @@ async function main() {
       C._destroyAgents();
     });
 
-    await step('服务重启后未送达的内容仍然保留', async () => {
+    await step('取消接收只报告拒收，并释放该文件的暂存', async () => {
+      const file = path.join(dirs.src, '拒收.txt');
+      await fsp.writeFile(file, 'decline this transfer');
+      const delivered = new Set();
+      const accepted = (e) => delivered.add(e.id);
+      const cancel = (e) => { if (e.dir === 'in' && e.state === 'active' && e.name === '拒收.txt') B.cancel(e.id); };
+      A.on('delivered', accepted);
+      B.on('entry', cancel);
+      try {
+        const out = A.sendPaths([file]);
+        const [receipt] = await waitFor(A, 'declined', (r) => r.id === out.remoteId, 5000);
+        assert.equal(receipt.by, B.opts.deviceId);
+        assert.ok(!delivered.has(out.remoteId));
+        assert.ok(!fs.existsSync(path.join(dirs.b, '拒收.txt')));
+        assert.ok(!fs.existsSync(path.join(dirs.data, 'blobs', out.remoteId)));
+        const saved = JSON.parse(await fsp.readFile(path.join(dirs.data, 'state.json'), 'utf8'));
+        assert.ok(!saved.items[out.remoteId]);
+      } finally {
+        A.off('delivered', accepted);
+        B.off('entry', cancel);
+      }
+    });
+
+    await step('创建或提交成功后立即强制重启，仍能继续上传和交付离线文字、文件', async () => {
       B.stop();
-      await sleep(200);
-      const out = A.sendText('survive restart');
-      await waitFor(A, 'entry', (e) => e.id === out.id && e.state === 'done');
-      await sleep(400);
-      const st = JSON.parse(await fsp.readFile(path.join(dirs.data, 'state.json'), 'utf8'));
-      assert.equal(Object.values(st.items).length, 1);
-      assert.equal(Object.values(st.items)[0].text, 'survive restart');
+      await waitFor(A, 'status', (s) => s.peers.every((p) => !p.online));
+      A.stop();
+      const restart = async () => {
+        await stopServer(srv, 'SIGKILL');
+        srv = await startServer(dirs.data);
+      };
+      const text = await A._json('POST', '/api/items', { kind: 'text', text: 'survive restart' });
+      await restart();
+      const bytes = Buffer.from('bytes after restart');
+      const file = await A._json('POST', '/api/items', { kind: 'files', files: [{ rel: '恢复.txt', size: bytes.length }] });
+      await restart();
+      const upload = await fetch(SERVER + `/api/items/${file.id}/files/0`, {
+        method: 'PUT', body: bytes, headers: { Authorization: 'Bearer ' + TOKEN, 'X-Device': A.opts.deviceId },
+      });
+      assert.equal(upload.status, 200);
+      await A._json('POST', `/api/items/${file.id}/commit`);
+      await restart();
+      const textDelivery = waitFor(B, 'received', (e) => e.remoteId === text.id, 5000);
+      const fileDelivery = waitFor(B, 'received', (e) => e.remoteId === file.id, 5000);
+      B.start();
+      const [[message], [entry]] = await Promise.all([textDelivery, fileDelivery]);
+      assert.equal(message.text, 'survive restart');
+      assert.deepEqual(await fsp.readFile(entry.paths[0]), bytes);
+    });
+
+    await step('损坏、结构无效或缺失的索引不会触发清理', async () => {
+      const indexes = [undefined, '{', '{"devices":{},"items":[]}', '{"devices":{},"items":{"abcdef":null}}'];
+      for (const [i, index] of indexes.entries()) {
+        const data = path.join(root, 'invalid-' + i);
+        const blob = path.join(data, 'blobs', 'stored-file', '0');
+        const indexFile = path.join(data, 'state.json');
+        await fsp.mkdir(path.dirname(blob), { recursive: true });
+        await fsp.writeFile(blob, 'awaiting collection');
+        if (index !== undefined) await fsp.writeFile(indexFile, index);
+        await assert.rejects(async () => {
+          const unexpected = await startServer(data, 0);
+          await stopServer(unexpected);
+        }, /中转进程退出 1: .*索引/);
+        assert.equal(await fsp.readFile(blob, 'utf8'), 'awaiting collection');
+        if (index === undefined) assert.ok(!fs.existsSync(indexFile));
+        else assert.equal(await fsp.readFile(indexFile, 'utf8'), index);
+      }
     });
   } finally {
     A.stop(); B.stop();
     A._destroyAgents(); B._destroyAgents();
-    srv.kill();
+    await stopServer(srv);
     await fsp.rm(root, { recursive: true, force: true });
   }
   const failed = results.filter((r) => r[0] === 'FAIL').length;
