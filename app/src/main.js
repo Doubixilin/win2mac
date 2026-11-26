@@ -447,19 +447,18 @@ const controlExtras = {
     return { ok: true };
   },
   async screenshot({ display = 0 }) {
-    if (isMac && systemPreferences.getMediaAccessStatus('screen') === 'denied') {
-      throw new Error('这台 Mac 没有给 Win2Mac“录屏”权限。请在 系统设置 → 隐私与安全性 → 录屏与系统录音 里打开 Win2Mac，然后重启 Win2Mac。');
-    }
     const displays = screen.getAllDisplays();
     const index = Math.min(Math.max(Number(display) || 0, 0), displays.length - 1);
     const d = displays[index];
     const scale = Math.min(1, 1600 / d.size.width); // 缩到 1600 宽以内，够看清又不至于太大
     const thumbnailSize = { width: Math.round(d.size.width * scale), height: Math.round(d.size.height * scale) };
-    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
-    const src = sources.find((x) => String(x.display_id) === String(d.id)) || sources[index] || sources[0];
-    if (!src || src.thumbnail.isEmpty()) {
-      throw new Error(isMac ? '截图失败：多半是还没授予“录屏”权限（系统设置 → 隐私与安全性 → 录屏与系统录音），授权后需重启 Win2Mac。' : '截图失败');
+    // 没有权限时也照常请求一次：这样 macOS 才会弹出授权询问，并把 Win2Mac 列进“录屏”权限列表
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize }).catch(() => []);
+    if (isMac && systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
+      throw new Error('这台 Mac 还没有给 Win2Mac“录屏”权限，已向系统发起授权请求。请在这台 Mac 的 系统设置 → 隐私与安全性 → 录屏与系统录音 里打开 Win2Mac，然后重启 Win2Mac 再试。');
     }
+    const src = sources.find((x) => String(x.display_id) === String(d.id)) || sources[index] || sources[0];
+    if (!src || src.thumbnail.isEmpty()) throw new Error('截图失败');
     const size = src.thumbnail.getSize();
     return { data: src.thumbnail.toJPEG(72).toString('base64'), mimeType: 'image/jpeg', width: size.width, height: size.height, index, count: displays.length };
   },
