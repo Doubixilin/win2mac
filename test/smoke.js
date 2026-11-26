@@ -1,0 +1,240 @@
+'use strict';
+// 真机冒烟测试：启动真正的 Electron 应用，对端用一个 Node Relay 模拟。
+// 用法（在 app 目录下）：npx electron ../test/smoke.js <输出目录>
+// 会短暂占用系统剪贴板（结束时恢复原来的文字）。
+
+const { app, clipboard, nativeImage } = require('electron');
+const { spawn, execFileSync } = require('child_process');
+const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const OUT = path.resolve(process.argv[2] || path.join(os.tmpdir(), 'w2m-smoke-out'));
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-smoke-'));
+const PORT = 18798;
+const TOKEN = crypto.randomBytes(24).toString('hex');
+const SERVER = `http://127.0.0.1:${PORT}`;
+const dirs = { data: `${ROOT}/data`, user: `${ROOT}/user`, recv: `${ROOT}/recv`, peer: `${ROOT}/peer`, src: `${ROOT}/src` };
+for (const d of [...Object.values(dirs), OUT]) fs.mkdirSync(d, { recursive: true });
+
+fs.writeFileSync(path.join(dirs.user, 'config.json'), JSON.stringify({
+  server: SERVER, token: TOKEN, deviceId: 'smoke-mac-001', deviceName: '家里Mac', downloadDir: dirs.recv,
+  notify: false, hotkey: '', openAtLogin: false, floatPos: { x: 200, y: 200 },
+}));
+process.env.W2M_USER_DATA = dirs.user;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const results = [];
+// 主进程未捕获异常默认会弹阻塞式对话框，测试里改成打印并失败退出
+process.on('uncaughtException', (e) => { console.log('UNCAUGHT', e.stack || e); results.push({ name: 'uncaught', ok: false, error: String(e.stack || e) }); });
+setTimeout(() => { console.log('WATCHDOG: 测试超过 150 秒，强制退出'); app.exit(2); }, 150e3).unref();
+async function step(name, fn) {
+  try { await fn(); results.push({ name, ok: true }); console.log('PASS', name); }
+  catch (e) { results.push({ name, ok: false, error: String(e.stack || e) }); console.log('FAIL', name, '\n   ', e.stack || e); }
+}
+async function until(fn, ms = 15e3, what = '条件') {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error(`等待超时：${what}`);
+    await sleep(80);
+  }
+}
+
+const srv = spawn(process.execPath, [path.join(__dirname, '../server/server.js')], {
+  env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', W2M_PORT: PORT, W2M_TOKEN: TOKEN, W2M_DATA: dirs.data }, stdio: 'inherit',
+});
+
+const { Relay } = require('../app/src/core.js');
+const main = require('../app/src/main.js');
+
+async function shot(win, name) {
+  const img = await win.webContents.capturePage();
+  fs.writeFileSync(path.join(OUT, name), img.toPNG());
+}
+
+async function cdpDrop(win, x, y, data) {
+  const dbg = win.webContents.debugger;
+  if (!dbg.isAttached()) dbg.attach('1.3');
+  const payload = { items: [], dragOperationsMask: 1, ...data };
+  for (const type of ['dragEnter', 'dragOver', 'drop']) {
+    await dbg.sendCommand('Input.dispatchDragEvent', { type, x, y, data: payload });
+    await sleep(60);
+  }
+}
+
+app.whenReady().then(async () => {
+  const savedClipboard = await clipboard.readText().catch(() => '');
+  const peer = new Relay({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', downloadDir: dirs.peer });
+  const got = [];
+  peer.on('received', (e, item) => got.push({ ...e, clip: item.clip }));
+  const next = async (pred, what) => {
+    const e = await until(() => got.find(pred), 20e3, what);
+    got.splice(got.indexOf(e), 1);
+    return e;
+  };
+
+  try {
+    await until(() => main.mainWin && main.floatWin && !main.mainWin.webContents.isLoading() && !main.floatWin.webContents.isLoading(), 15e3, '窗口加载');
+    const js = (win, code) => win.webContents.executeJavaScript(code, true);
+    await sleep(600);
+
+    await step('启动后主界面和悬浮窗都显示', async () => {
+      assert.ok(main.mainWin.isVisible(), '主窗口应可见');
+      assert.ok(main.floatWin.isVisible(), '悬浮窗应可见');
+      assert.ok(main.floatWin.isAlwaysOnTop());
+      await until(() => main.relay.connected, 10e3, '连接服务器');
+      await shot(main.mainWin, '1-main-alone.png');
+    });
+
+    await step('对端上线后界面显示在线', async () => {
+      peer.start();
+      await until(() => js(main.mainWin, `document.getElementById('peerName').textContent === '办公Win' && document.getElementById('dot').classList.contains('online')`), 10e3, '在线状态');
+      assert.ok(await js(main.floatWin, `document.getElementById('dot').classList.contains('online')`));
+    });
+
+    await step('输入框打字回车 → 对端收到文字', async () => {
+      await js(main.mainWin, `(() => { const t = document.getElementById('text'); t.value = '界面输入的文字\\n第二行'; t.dispatchEvent(new Event('input')); t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
+      const e = await next((x) => x.kind === 'text', '文字');
+      assert.equal(e.text, '界面输入的文字\n第二行');
+      assert.equal(e.peer, '家里Mac');
+      assert.equal(await js(main.mainWin, `document.getElementById('text').value`), '');
+    });
+
+    const f1 = path.join(dirs.src, '报告.docx'), f2 = path.join(dirs.src, 'photo.jpg');
+    fs.writeFileSync(f1, crypto.randomBytes(300 * 1024));
+    fs.writeFileSync(f2, crypto.randomBytes(1200 * 1024));
+    await step('把两个文件拖进主界面 → 对端收到（真实拖放事件）', async () => {
+      await cdpDrop(main.mainWin, 200, 150, { files: [f1, f2] });
+      const e = await next((x) => x.kind === 'files', '文件');
+      assert.equal(e.paths.length, 2);
+      assert.ok(fs.readFileSync(path.join(dirs.peer, '报告.docx')).equals(fs.readFileSync(f1)));
+      assert.ok(fs.readFileSync(path.join(dirs.peer, 'photo.jpg')).equals(fs.readFileSync(f2)));
+    });
+
+    await step('把文件夹拖到悬浮窗 → 对端收到整个目录', async () => {
+      const folder = path.join(dirs.src, '合同资料');
+      fs.mkdirSync(path.join(folder, '附件'), { recursive: true });
+      fs.writeFileSync(path.join(folder, '说明.txt'), '说明');
+      fs.writeFileSync(path.join(folder, '附件/a.pdf'), crypto.randomBytes(5000));
+      await cdpDrop(main.floatWin, 38, 38, { files: [folder] });
+      const e = await next((x) => x.kind === 'files', '文件夹');
+      assert.equal(path.basename(e.paths[0]), '合同资料');
+      assert.equal(fs.readFileSync(path.join(dirs.peer, '合同资料/说明.txt'), 'utf8'), '说明');
+      assert.equal(fs.statSync(path.join(dirs.peer, '合同资料/附件/a.pdf')).size, 5000);
+    });
+
+    await step('把选中的文字拖到悬浮窗 → 对端收到文字', async () => {
+      await cdpDrop(main.floatWin, 38, 38, { items: [{ mimeType: 'text/plain', data: '拖过来的一段文字' }] });
+      assert.equal((await next((x) => x.kind === 'text', '拖放文字')).text, '拖过来的一段文字');
+    });
+
+    await step('快捷键路径：剪贴板里是文字', async () => {
+      await clipboard.writeText('剪贴板文字 123');
+      assert.equal(await main.sendClipboard(), true);
+      assert.equal((await next((x) => x.kind === 'text', '剪贴板文字')).text, '剪贴板文字 123');
+    });
+
+    await step('快捷键路径：剪贴板里是访达复制的文件', async () => {
+      if (process.platform !== 'darwin') return;
+      execFileSync('osascript', ['-e', `set the clipboard to (POSIX file "${f1}")`]);
+      await sleep(300);
+      assert.deepEqual((await main.readClipboard()).files, [f1]);
+      assert.equal(await main.sendClipboard(), true);
+      const e = await next((x) => x.kind === 'files', '剪贴板文件');
+      assert.equal(path.basename(e.paths[0]), '报告 (2).docx'); // 对端已有同名文件，自动改名
+    });
+
+    await step('快捷键路径：剪贴板里是截图 → 对端收到 png 且带剪贴板标记', async () => {
+      await main.writeClipboardImage(fs.readFileSync(path.join(__dirname, '../app/assets/icon.png')));
+      await sleep(200);
+      assert.equal(await main.sendClipboard(), true);
+      const e = await next((x) => x.kind === 'files', '截图');
+      assert.match(path.basename(e.paths[0]), /^截图-\d{8}-\d{6}\.png$/);
+      assert.equal(e.clip, true);
+      assert.ok(!nativeImage.createFromPath(e.paths[0]).isEmpty());
+    });
+
+    await step('对端发来文字 → 自动进剪贴板，出现在记录里', async () => {
+      clipboard.clear();
+      peer.sendText('从 Windows 发来的内容');
+      await until(async () => (await clipboard.readText()) === '从 Windows 发来的内容', 10e3, '剪贴板更新');
+      await until(() => js(main.mainWin, `[...document.querySelectorAll('.item.in .title')].some(n => n.textContent === '从 Windows 发来的内容')`), 5e3, '记录显示');
+    });
+
+    await step('对端从剪贴板发来截图 → 本机剪贴板里直接有这张图', async () => {
+      clipboard.clear();
+      const png = path.join(dirs.src, '截图-20261126-101500.png');
+      fs.copyFileSync(path.join(__dirname, '../app/assets/drag.png'), png);
+      peer.sendPaths([png], { clip: true });
+      await until(async () => (await main.readClipboard()).image, 10e3, '剪贴板图片');
+      assert.ok(fs.existsSync(path.join(dirs.recv, '截图-20261126-101500.png')));
+    });
+
+    await step('对端发来文件夹和大文件 → 落到接收目录，记录可操作', async () => {
+      const big = path.join(dirs.src, '安装包.zip');
+      fs.writeFileSync(big, crypto.randomBytes(30 * 2 ** 20));
+      peer.sendPaths([big, path.join(dirs.src, '合同资料')]);
+      await until(() => main.history.find((h) => h.dir === 'in' && h.kind === 'files' && h.state === 'done' && h.name.startsWith('安装包.zip')), 30e3, '接收完成');
+      assert.ok(fs.readFileSync(path.join(dirs.recv, '安装包.zip')).equals(fs.readFileSync(big)));
+      assert.equal(fs.readFileSync(path.join(dirs.recv, '合同资料/说明.txt'), 'utf8'), '说明');
+      const li = await js(main.mainWin, `(() => { const li = [...document.querySelectorAll('.item.in')].find(n => n.querySelector('.title').textContent.startsWith('安装包.zip')); return { draggable: li.draggable, acts: [...li.querySelectorAll('.acts button')].map(b => b.textContent) }; })()`);
+      assert.equal(li.draggable, true);
+      assert.deepEqual(li.acts, ['在文件夹中显示', '删除记录']);
+    });
+
+    await step('发出的记录在对端收完后变成“已送达”', async () => {
+      await until(() => js(main.mainWin, `[...document.querySelectorAll('.item.out .meta .ok')].length >= 6`), 8e3, '已送达标记');
+    });
+
+    await step('悬浮窗有未读角标，打开主界面后清零', async () => {
+      await js(main.mainWin, 'window.blur()');
+      main.mainWin.hide();
+      peer.sendText('窗口隐藏时收到的');
+      await until(() => js(main.floatWin, `document.getElementById('badge').classList.contains('show')`), 8e3, '角标');
+      await sleep(400);
+      await shot(main.floatWin, '3-float-badge.png');
+      main.showMain();
+      await until(() => js(main.floatWin, `!document.getElementById('badge').classList.contains('show')`), 5e3, '角标清零');
+    });
+
+    await step('截图：主界面、设置页', async () => {
+      await sleep(500);
+      await shot(main.mainWin, '2-main-history.png');
+      await js(main.mainWin, `document.getElementById('btnSettings').click()`);
+      await sleep(400);
+      assert.equal(await js(main.mainWin, `document.getElementById('server').value`), SERVER);
+      await shot(main.mainWin, '4-settings.png');
+      await js(main.mainWin, `document.getElementById('cancelSettings').click()`);
+    });
+
+    await step('配对码可以还原出服务器和口令；悬浮窗位置可保存', async () => {
+      const code = await js(main.mainWin, `w2m.state().then(s => s.config.pairCode)`);
+      assert.match(code, /^w2m:/);
+      const decoded = JSON.parse(Buffer.from(code.slice(4), 'base64url').toString());
+      assert.deepEqual(decoded, { s: SERVER, t: TOKEN });
+      assert.deepEqual(main.floatWin.getBounds(), { x: 200, y: 200, width: 76, height: 76 });
+    });
+
+    await step('服务器断开后界面提示未连接，恢复后自动重连', async () => {
+      srv.kill();
+      await until(() => js(main.mainWin, `document.getElementById('peerName').textContent === '未连接服务器'`), 10e3, '未连接提示');
+      await shot(main.mainWin, '5-main-offline.png');
+    });
+  } catch (e) {
+    results.push({ name: '测试框架', ok: false, error: String(e.stack || e) });
+    console.log('FATAL', e);
+  } finally {
+    await clipboard.writeText(savedClipboard).catch(() => {});
+    peer.stop();
+    srv.kill();
+    fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
+    const failed = results.filter((r) => !r.ok).length;
+    console.log(`\n${results.length - failed}/${results.length} 通过，截图在 ${OUT}`);
+    fs.rmSync(ROOT, { recursive: true, force: true });
+    app.exit(failed ? 1 : 0);
+  }
+});

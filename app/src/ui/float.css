@@ -1,0 +1,35 @@
+html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none; }
+body { display: grid; place-items: center; }
+
+.ball {
+  position: relative; width: 60px; height: 60px; border-radius: 50%;
+  background: linear-gradient(140deg, #4f7dff, #7a5cff); color: #fff;
+  box-shadow: 0 3px 10px rgba(30, 40, 90, .35), inset 0 0 0 1px rgba(255, 255, 255, .18);
+  display: grid; place-items: center; cursor: pointer;
+  transition: transform .15s ease, background .2s, filter .2s;
+}
+.ball:hover { transform: scale(1.05); }
+.ball.offline { background: linear-gradient(140deg, #8a909c, #6d7380); }
+.ball.over { transform: scale(1.14); background: linear-gradient(140deg, #19b36b, #0e9a8a); }
+.ball.moving { cursor: grabbing; transform: scale(1.06); }
+.ball.flash-ok { background: linear-gradient(140deg, #19b36b, #0e9a8a); }
+.ball.flash-err { background: linear-gradient(140deg, #e05252, #c0392b); }
+
+.glyph { width: 30px; height: 30px; fill: none; stroke: currentColor; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; grid-area: 1 / 1; opacity: 0; transition: opacity .12s; pointer-events: none; }
+.ball .g-idle { opacity: 1; }
+.ball.over .g-idle, .ball.flash-ok .g-idle, .ball.flash-err .g-idle { opacity: 0; }
+.ball.over .g-drop { opacity: 1; }
+.ball.flash-ok:not(.over) .g-ok { opacity: 1; }
+.ball.flash-err:not(.over) .g-err { opacity: 1; }
+
+.ring { position: absolute; inset: -2px; width: 64px; height: 64px; transform: rotate(-90deg); pointer-events: none; opacity: 0; transition: opacity .2s; }
+.ring circle { fill: none; stroke: #fff; stroke-width: 3.5; stroke-linecap: round; stroke-dasharray: 182.2; stroke-dashoffset: 182.2; transition: stroke-dashoffset .15s linear; }
+.ball.busy .ring { opacity: 1; }
+.ball.busy .glyph { transform: scale(.82); }
+
+.dot { position: absolute; right: 3px; bottom: 3px; width: 11px; height: 11px; border-radius: 50%; background: #9aa0aa; border: 2px solid #fff; pointer-events: none; }
+.dot.online { background: #2ecc71; }
+.dot.waiting { background: #f0b429; }
+
+.badge { position: absolute; right: -2px; top: -2px; min-width: 18px; height: 18px; padding: 0 5px; box-sizing: border-box; border-radius: 9px; background: #ff4d4f; color: #fff; font: 600 11px/18px -apple-system, "Segoe UI", sans-serif; text-align: center; display: none; pointer-events: none; }
+.badge.show { display: block; }

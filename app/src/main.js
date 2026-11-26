@@ -1,0 +1,525 @@
+'use strict';
+const {
+  app, BrowserWindow, Tray, Menu, ipcMain, dialog, clipboard, nativeImage,
+  globalShortcut, Notification, shell, screen, ClipboardItem,
+} = require('electron');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
+const { execFile } = require('child_process');
+const { fileURLToPath } = require('url');
+const { Relay } = require('./core');
+
+// 测试时用独立的数据目录，这样可以同时开多个实例
+if (process.env.W2M_USER_DATA) app.setPath('userData', process.env.W2M_USER_DATA);
+
+const isMac = process.platform === 'darwin';
+const ASSETS = path.join(__dirname, '..', 'assets');
+const FLOAT_SIZE = 76;
+const HISTORY_MAX = 300;
+
+let config = null;
+let history = [];
+let relay = null;
+let mainWin = null;
+let floatWin = null;
+let tray = null;
+let quitting = false;
+let unseen = 0;
+
+// ---------- 配置与历史 ----------
+
+const file = (name) => path.join(app.getPath('userData'), name);
+
+function defaults() {
+  return {
+    server: '', token: '',
+    deviceId: 'd' + crypto.randomBytes(8).toString('hex'),
+    deviceName: os.hostname().replace(/\.(local|lan)$/i, ''),
+    downloadDir: path.join(app.getPath('downloads'), 'Win2Mac'),
+    hotkey: 'Ctrl+Alt+S',
+    autoCopy: true, notify: true, showFloat: true, openAtLogin: true,
+    floatPos: null,
+  };
+}
+
+function readJson(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+}
+function writeJson(p, data) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p + '.tmp', JSON.stringify(data, null, 2));
+  fs.renameSync(p + '.tmp', p);
+}
+
+function loadConfig() {
+  const saved = readJson(file('config.json'), {});
+  config = { ...defaults(), ...saved };
+  if (!saved.deviceId) saveConfig();
+}
+function saveConfig() { writeJson(file('config.json'), config); }
+
+let historyTimer = null;
+function saveHistorySoon() {
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(() => writeJson(file('history.json'), history), 500);
+}
+function loadHistory() {
+  history = readJson(file('history.json'), []);
+  // 上次退出时还没传完的，标记为中断
+  for (const e of history) if (e.state === 'active') { e.state = 'error'; e.error = '传输中断'; }
+}
+
+const clean = (entry) => { const { _t, ...rest } = entry; return rest; };
+
+function upsertEntry(entry) {
+  const e = clean(entry);
+  const i = history.findIndex((h) => h.id === e.id);
+  if (i >= 0) history[i] = { ...history[i], ...e };
+  else { history.unshift(e); if (history.length > HISTORY_MAX) history.length = HISTORY_MAX; }
+  saveHistorySoon();
+  broadcast('entry', i >= 0 ? history[i] : e);
+}
+
+function pairCode() {
+  if (!config.server || !config.token) return '';
+  return 'w2m:' + Buffer.from(JSON.stringify({ s: config.server, t: config.token })).toString('base64url');
+}
+function parsePairCode(code) {
+  const m = /^\s*w2m:([A-Za-z0-9_-]+)\s*$/.exec(code || '');
+  if (!m) return null;
+  try {
+    const o = JSON.parse(Buffer.from(m[1], 'base64url').toString('utf8'));
+    return o.s && o.t ? { server: String(o.s), token: String(o.t) } : null;
+  } catch { return null; }
+}
+
+// ---------- 窗口 ----------
+
+function broadcast(channel, data) {
+  for (const w of [mainWin, floatWin]) if (w && !w.isDestroyed()) w.webContents.send(channel, data);
+}
+
+function webPrefs() {
+  return { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false };
+}
+
+function createMain() {
+  mainWin = new BrowserWindow({
+    width: 440, height: 700, minWidth: 380, minHeight: 480, show: false,
+    title: 'Win2Mac', icon: path.join(ASSETS, 'icon.png'),
+    backgroundColor: '#f5f6f8', autoHideMenuBar: true, webPreferences: webPrefs(),
+  });
+  mainWin.loadFile(path.join(__dirname, 'ui', 'main.html'));
+  mainWin.on('close', (e) => {
+    if (quitting) return;
+    e.preventDefault();
+    mainWin.hide();
+    if (isMac) app.dock?.hide();
+  });
+  mainWin.on('blur', () => { mainBlurredAt = Date.now(); });
+  // 窗口自身不跳转、不开新窗口
+  mainWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWin.webContents.on('will-navigate', (e) => e.preventDefault());
+}
+
+function showMain() {
+  if (!mainWin || mainWin.isDestroyed()) createMain();
+  if (isMac) app.dock?.show();
+  if (mainWin.isMinimized()) mainWin.restore();
+  mainWin.show();
+  mainWin.focus();
+  unseen = 0;
+  broadcast('unseen', unseen);
+}
+
+// 点悬浮球时焦点会先被悬浮球抢走，所以“刚刚还在前台”也算在前台，这样单击才能真正收起主界面
+let mainBlurredAt = 0;
+function toggleMain() {
+  const front = mainWin && !mainWin.isDestroyed() && mainWin.isVisible() && (mainWin.isFocused() || Date.now() - mainBlurredAt < 700);
+  if (front) mainWin.close();
+  else showMain();
+}
+
+function floatBounds() {
+  const area = screen.getPrimaryDisplay().workArea;
+  let { x, y } = config.floatPos || { x: area.x + area.width - FLOAT_SIZE - 28, y: area.y + area.height - FLOAT_SIZE - 120 };
+  // 显示器布局变了的话，把悬浮窗拉回可见区域
+  const d = screen.getDisplayNearestPoint({ x: x + FLOAT_SIZE / 2, y: y + FLOAT_SIZE / 2 }).workArea;
+  x = Math.min(Math.max(x, d.x), d.x + d.width - FLOAT_SIZE);
+  y = Math.min(Math.max(y, d.y), d.y + d.height - FLOAT_SIZE);
+  return { x: Math.round(x), y: Math.round(y), width: FLOAT_SIZE, height: FLOAT_SIZE };
+}
+
+function createFloat() {
+  floatWin = new BrowserWindow({
+    ...floatBounds(),
+    frame: false, transparent: true, resizable: false, movable: true, minimizable: false, maximizable: false,
+    fullscreenable: false, skipTaskbar: true, hasShadow: false, alwaysOnTop: true, show: false,
+    backgroundColor: '#00000000', webPreferences: webPrefs(),
+  });
+  floatWin.setAlwaysOnTop(true, 'floating');
+  if (isMac) floatWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+  floatWin.loadFile(path.join(__dirname, 'ui', 'float.html'));
+  floatWin.once('ready-to-show', () => { if (config.showFloat) floatWin.showInactive(); });
+  floatWin.on('close', (e) => { if (!quitting) { e.preventDefault(); floatWin.hide(); } });
+}
+
+function setFloatVisible(v) {
+  config.showFloat = v;
+  saveConfig();
+  if (!floatWin || floatWin.isDestroyed()) createFloat();
+  else if (v) { floatWin.setBounds(floatBounds()); floatWin.showInactive(); } else floatWin.hide();
+  refreshTray();
+  broadcast('config', publicConfig());
+}
+
+// 悬浮窗拖动：无边框透明窗口用 CSS 拖动区会吞掉拖放事件，所以自己跟随鼠标移动
+let dragTimer = null;
+function floatDragStart() {
+  if (!floatWin) return;
+  const cur = screen.getCursorScreenPoint();
+  const [wx, wy] = floatWin.getPosition();
+  const off = { x: cur.x - wx, y: cur.y - wy };
+  const started = Date.now();
+  clearInterval(dragTimer);
+  dragTimer = setInterval(() => {
+    if (!floatWin || floatWin.isDestroyed() || Date.now() - started > 60e3) return floatDragEnd();
+    const p = screen.getCursorScreenPoint();
+    floatWin.setBounds({ x: p.x - off.x, y: p.y - off.y, width: FLOAT_SIZE, height: FLOAT_SIZE });
+  }, 12);
+}
+function floatDragEnd() {
+  clearInterval(dragTimer);
+  dragTimer = null;
+  if (!floatWin || floatWin.isDestroyed()) return;
+  const [x, y] = floatWin.getPosition();
+  config.floatPos = { x, y };
+  saveConfig();
+}
+
+// ---------- 托盘与菜单 ----------
+
+function menuTemplate() {
+  const st = relay.status();
+  const peer = st.peers.find((p) => p.online);
+  const line = !st.configured ? '尚未配置' : !st.connected ? `未连接${st.error ? '：' + st.error : ''}` : peer ? `${peer.name} 在线` : '对方不在线（发送后会暂存）';
+  return [
+    { label: line, enabled: false },
+    { type: 'separator' },
+    { label: '打开主界面', click: showMain },
+    { label: '发送剪贴板', accelerator: activeHotkey || undefined, click: () => sendClipboard() },
+    { label: '打开接收文件夹', click: openDownloadDir },
+    { type: 'separator' },
+    { label: '显示悬浮窗', type: 'checkbox', checked: config.showFloat, click: (i) => setFloatVisible(i.checked) },
+    { label: '开机自动启动', type: 'checkbox', checked: config.openAtLogin, click: (i) => applyConfig({ openAtLogin: i.checked }) },
+    { type: 'separator' },
+    { label: '退出 Win2Mac', click: () => { quitting = true; app.quit(); } },
+  ];
+}
+
+function refreshTray() {
+  if (!tray) return;
+  const st = relay.status();
+  tray.setToolTip(st.connected ? 'Win2Mac：已连接' : 'Win2Mac：未连接');
+  tray.setContextMenu(Menu.buildFromTemplate(menuTemplate()));
+}
+
+function createTray() {
+  const img = nativeImage.createFromPath(path.join(ASSETS, isMac ? 'trayTemplate.png' : 'tray.png'));
+  if (isMac) img.setTemplateImage(true);
+  tray = new Tray(img);
+  if (!isMac) tray.on('click', showMain);
+  refreshTray();
+}
+
+// ---------- 发送 ----------
+
+function needConfig() {
+  if (relay.configured) return false;
+  showMain();
+  broadcast('open-settings', '先填好服务器地址和口令才能发送');
+  return true;
+}
+
+function sendText(text) {
+  if (needConfig() || typeof text !== 'string' || !text.trim()) return false;
+  relay.sendText(text);
+  return true;
+}
+
+function sendPaths(paths, opts) {
+  if (needConfig()) return false;
+  const ok = (paths || []).filter((p) => typeof p === 'string' && p && fs.existsSync(p));
+  if (!ok.length) return false;
+  relay.sendPaths(ok, opts);
+  return true;
+}
+
+function runPs(script) {
+  return new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script],
+      { windowsHide: true, timeout: 8000, encoding: 'utf8' }, (err, out) => resolve(err ? '' : out));
+  });
+}
+
+const rawFormat = (f) => `electron application/osclipboard;format="${f}"`;
+
+async function blobBuffer(item, type) {
+  const blob = await item.getType(type);
+  return Buffer.from(await blob.arrayBuffer());
+}
+
+/**
+ * 读一次剪贴板，按“文件 > 文字 > 图片”的优先级归类。
+ * 访达/资源管理器里复制文件时，剪贴板同时还带着文件名文字和图标图片，所以文件必须最先判断；
+ * 从 Excel 之类复制时同时有文字和渲染图，所以文字排在图片前面。
+ */
+async function readClipboard() {
+  const items = await clipboard.read().catch(() => []);
+  const files = [];
+  let image = null;
+  for (const it of items) {
+    try {
+      if (it.types.includes('text/uri-list')) {
+        const list = (await blobBuffer(it, 'text/uri-list')).toString('utf8');
+        for (const line of list.split(/\r?\n/)) {
+          if (!line.startsWith('file://')) continue;
+          try { files.push(fileURLToPath(line.trim())); } catch {}
+        }
+      } else if (isMac && it.types.includes(rawFormat('NSFilenamesPboardType'))) {
+        const plist = (await blobBuffer(it, rawFormat('NSFilenamesPboardType'))).toString('utf8');
+        for (const m of plist.matchAll(/<string>([^<]*)<\/string>/g)) {
+          files.push(m[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&'));
+        }
+      }
+      if (!image && it.types.includes('image/png')) image = await blobBuffer(it, 'image/png');
+    } catch (e) { console.error('读取剪贴板条目失败', e); }
+  }
+  const text = await clipboard.readText().catch(() => '');
+  let existing = [...new Set(files)].filter((p) => fs.existsSync(p));
+  // Windows 兜底：什么都没读到时，再问一次 PowerShell 有没有复制的文件
+  if (!existing.length && !text.trim() && !image && process.platform === 'win32') {
+    const out = await runPs('[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }');
+    existing = out.split(/\r?\n/).map((x) => x.trim()).filter((p) => p && fs.existsSync(p));
+  }
+  return { files: existing, text, image };
+}
+
+function writeClipboardImage(pngBuffer) {
+  return clipboard.write([new ClipboardItem({ 'image/png': new Blob([pngBuffer], { type: 'image/png' }) })]);
+}
+
+function stamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function sendClipboard() {
+  if (needConfig()) return false;
+  const { files, text, image } = await readClipboard();
+  if (files.length) return sendPaths(files);
+  if (text.trim()) return sendText(text);
+  if (image) {
+    const dir = path.join(app.getPath('temp'), 'win2mac-out');
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, `截图-${stamp()}.png`);
+    fs.writeFileSync(p, image);
+    return sendPaths([p], { clip: true });
+  }
+  notify('剪贴板是空的', '先复制文字、图片或文件，再按快捷键发送');
+  return false;
+}
+
+async function pick(kind) {
+  const props = kind === 'folder' ? ['openDirectory', 'multiSelections'] : ['openFile', 'multiSelections'];
+  const r = await dialog.showOpenDialog(mainWin, {
+    title: kind === 'folder' ? '选择要发送的文件夹' : '选择要发送的文件', buttonLabel: '发送', properties: props,
+  });
+  if (r.canceled || !r.filePaths.length) return false;
+  return sendPaths(r.filePaths);
+}
+
+// ---------- 接收 ----------
+
+function notify(title, body, onClick) {
+  if (!config.notify || !Notification.isSupported()) return;
+  const n = new Notification({ title, body: body || '', silent: false });
+  if (onClick) n.on('click', onClick);
+  n.show();
+}
+
+function onReceived(entry, item) {
+  if (!mainWin?.isVisible() || !mainWin.isFocused()) { unseen++; broadcast('unseen', unseen); }
+  if (entry.kind === 'text') {
+    if (config.autoCopy) clipboard.writeText(entry.text).catch((e) => console.error('写剪贴板失败', e));
+    const preview = entry.text.replace(/\s+/g, ' ').slice(0, 120);
+    notify(config.autoCopy ? `${entry.peer} 发来文字（已复制）` : `${entry.peer} 发来文字`, preview, showMain);
+    return;
+  }
+  const first = entry.paths[0];
+  // 对方是从剪贴板发来的截图：除了存文件，也直接放进本机剪贴板，方便马上粘贴
+  if (item.clip && config.autoCopy && entry.paths.length === 1 && /\.png$/i.test(first)) {
+    fs.promises.readFile(first).then(writeClipboardImage).catch((e) => console.error('写剪贴板失败', e));
+  }
+  notify(`${entry.peer} 发来${entry.fileCount > 1 ? ` ${entry.fileCount} 个文件` : '文件'}`, entry.name, () => shell.showItemInFolder(first));
+}
+
+function openDownloadDir() {
+  fs.mkdirSync(config.downloadDir, { recursive: true });
+  shell.openPath(config.downloadDir);
+}
+
+// ---------- 配置生效 ----------
+
+let activeHotkey = '';
+function registerHotkey() {
+  globalShortcut.unregisterAll();
+  activeHotkey = '';
+  if (!config.hotkey) return true;
+  try {
+    if (globalShortcut.register(config.hotkey, () => sendClipboard())) { activeHotkey = config.hotkey; return true; }
+  } catch {}
+  return false;
+}
+
+function publicConfig() {
+  return { ...config, pairCode: pairCode(), hotkeyActive: !!activeHotkey || !config.hotkey };
+}
+
+function applyLoginItem() {
+  if (!app.isPackaged) return; // 开发模式下注册的是 electron 本体，没有意义
+  app.setLoginItemSettings({ openAtLogin: !!config.openAtLogin, args: ['--hidden'] });
+}
+
+function applyConfig(patch) {
+  const before = { ...config };
+  const allowed = ['server', 'token', 'deviceName', 'downloadDir', 'hotkey', 'autoCopy', 'notify', 'showFloat', 'openAtLogin'];
+  for (const k of allowed) if (k in patch) config[k] = patch[k];
+  config.server = String(config.server || '').trim().replace(/\/+$/, '');
+  config.token = String(config.token || '').trim();
+  config.deviceName = String(config.deviceName || '').trim() || defaults().deviceName;
+  saveConfig();
+
+  let hotkeyOk = true;
+  if (config.hotkey !== before.hotkey) hotkeyOk = registerHotkey();
+  if (config.openAtLogin !== before.openAtLogin) applyLoginItem();
+  if (config.showFloat !== before.showFloat) setFloatVisible(config.showFloat);
+  if (['server', 'token', 'deviceName', 'downloadDir'].some((k) => config[k] !== before[k])) {
+    relay.configure(config);
+    relay.start();
+  }
+  refreshTray();
+  broadcast('config', publicConfig());
+  return { ok: true, hotkeyOk };
+}
+
+// ---------- IPC ----------
+
+function setupIpc() {
+  const h = (name, fn) => ipcMain.handle(name, (e, ...args) => fn(...args, e));
+  h('state', () => ({ config: publicConfig(), status: relay.status(), history, unseen, platform: process.platform, version: app.getVersion() }));
+  h('send-text', (text) => sendText(text));
+  h('send-paths', (paths) => sendPaths(paths));
+  h('send-clipboard', () => sendClipboard());
+  h('send-blob', (name, data) => {
+    // 从浏览器等处拖来的、没有磁盘路径的内容：先落到临时目录再发
+    const dir = path.join(app.getPath('temp'), 'win2mac-out', stamp() + '-' + crypto.randomBytes(3).toString('hex'));
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, path.basename(String(name || 'file')).replace(/[<>:"|?*\\/]/g, '_') || 'file');
+    fs.writeFileSync(p, Buffer.from(data));
+    return sendPaths([p]);
+  });
+  h('pick', (kind) => pick(kind));
+  h('copy-text', async (text) => { await clipboard.writeText(String(text)); return true; });
+  h('reveal', (p) => { if (fs.existsSync(p)) shell.showItemInFolder(p); else return false; return true; });
+  h('open-path', async (p) => (fs.existsSync(p) ? !(await shell.openPath(p)) : false));
+  h('open-download-dir', () => openDownloadDir());
+  h('exists', (paths) => (paths || []).map((p) => fs.existsSync(p)));
+  h('save-config', (patch) => applyConfig(patch || {}));
+  h('apply-pair-code', (code) => {
+    const parsed = parsePairCode(code);
+    return parsed ? { ...applyConfig(parsed), ...parsed } : { ok: false, error: '配对码格式不对' };
+  });
+  h('test-connection', async (server, token) => {
+    try { await Relay.ping(String(server || '').trim().replace(/\/+$/, ''), String(token || '').trim()); return { ok: true }; }
+    catch (e) { return { ok: false, error: e.status === 401 ? '口令错误' : (e.message || '连接失败') }; }
+  });
+  h('choose-download-dir', async () => {
+    const r = await dialog.showOpenDialog(mainWin, { title: '选择接收文件夹', defaultPath: config.downloadDir, properties: ['openDirectory', 'createDirectory'] });
+    return r.canceled ? null : r.filePaths[0];
+  });
+  h('remove-entry', (id) => { history = history.filter((x) => x.id !== id); saveHistorySoon(); return true; });
+  h('clear-history', () => { history = history.filter((x) => x.state === 'active'); saveHistorySoon(); return history; });
+  h('cancel', (id) => { relay.cancel(id); return true; });
+  h('remove-device', async (id) => {
+    try { await relay.removeDevice(String(id)); return { ok: true }; }
+    catch (e) { return { ok: false, error: e.message || '移除失败' }; }
+  });
+
+  ipcMain.on('start-drag', (e, paths) => {
+    const files = (paths || []).filter((p) => fs.existsSync(p));
+    if (files.length) e.sender.startDrag({ files, file: files[0], icon: nativeImage.createFromPath(path.join(ASSETS, 'drag.png')) });
+  });
+  ipcMain.on('float-drag-start', floatDragStart);
+  ipcMain.on('float-drag-end', floatDragEnd);
+  ipcMain.on('toggle-main', toggleMain);
+  ipcMain.on('float-menu', () => Menu.buildFromTemplate(menuTemplate()).popup({ window: floatWin }));
+}
+
+// ---------- 启动 ----------
+
+function setupRelay() {
+  relay = new Relay(config);
+  relay.on('status', (s) => { broadcast('status', s); refreshTray(); });
+  relay.on('entry', upsertEntry);
+  relay.on('received', onReceived);
+  relay.on('delivered', ({ id, byName }) => {
+    const e = history.find((x) => x.remoteId === id);
+    if (e) upsertEntry({ ...e, delivered: true, deliveredTo: byName });
+  });
+  relay.on('warn', (e) => console.error('relay:', e?.message || e));
+  relay.start();
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', showMain);
+  app.on('before-quit', () => { quitting = true; });
+  app.on('window-all-closed', () => {}); // 常驻托盘，不随窗口关闭退出
+  app.on('activate', showMain);
+  app.on('will-quit', () => {
+    globalShortcut.unregisterAll();
+    clearTimeout(historyTimer);
+    try { writeJson(file('history.json'), history); } catch {}
+  });
+
+  app.whenReady().then(() => {
+    if (process.platform === 'win32') app.setAppUserModelId('com.doubilin.win2mac');
+    loadConfig();
+    loadHistory();
+    Menu.setApplicationMenu(isMac ? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'windowMenu' }]) : null);
+    setupRelay();
+    setupIpc();
+    registerHotkey();
+    applyLoginItem();
+    createTray();
+    createFloat();
+    createMain();
+
+    const hidden = process.argv.includes('--hidden') || (isMac && app.getLoginItemSettings().wasOpenedAtLogin);
+    if (hidden && relay.configured) { if (isMac) app.dock?.hide(); }
+    else mainWin.once('ready-to-show', showMain);
+
+    screen.on('display-removed', () => { if (floatWin?.isVisible()) floatWin.setBounds(floatBounds()); });
+  });
+}
+
+// 供冒烟测试脚本驱动
+module.exports = {
+  get relay() { return relay; }, get mainWin() { return mainWin; }, get floatWin() { return floatWin; },
+  get config() { return config; }, get history() { return history; },
+  sendClipboard, readClipboard, writeClipboardImage, applyConfig, showMain,
+};

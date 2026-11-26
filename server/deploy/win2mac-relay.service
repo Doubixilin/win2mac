@@ -1,0 +1,21 @@
+[Unit]
+Description=win2mac relay (text/file transfer between my machines)
+After=network.target
+
+[Service]
+Type=simple
+User=win2mac
+Group=win2mac
+EnvironmentFile=/etc/win2mac/relay.env
+ExecStart=/usr/bin/env node /opt/win2mac/server.js
+Restart=always
+RestartSec=3
+# 只允许写自己的数据目录
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/win2mac
+
+[Install]
+WantedBy=multi-user.target

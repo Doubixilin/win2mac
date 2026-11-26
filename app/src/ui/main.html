@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+<title>Win2Mac</title>
+<link rel="stylesheet" href="main.css">
+</head>
+<body>
+<header>
+  <div class="peer">
+    <span id="dot" class="dot"></span>
+    <div>
+      <div id="peerName" class="peer-name">未连接</div>
+      <div id="peerState" class="peer-state">正在连接服务器…</div>
+    </div>
+  </div>
+  <button id="btnSettings" class="icon-btn" title="设置" aria-label="设置">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+  </button>
+</header>
+
+<main>
+  <section id="drop" class="drop">
+    <svg class="drop-icon" viewBox="0 0 48 48" width="40" height="40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M10 18h26M28 10l8 8-8 8"/><path d="M38 32H12M20 24l-8 8 8 8"/></svg>
+    <p class="drop-title">把文件、文件夹或文字拖到这里</p>
+    <p class="drop-sub" id="dropSub">松手就发给对方，也可以直接粘贴</p>
+    <div class="row">
+      <button id="pickFiles" class="btn">选择文件</button>
+      <button id="pickFolder" class="btn">选择文件夹</button>
+      <button id="sendClip" class="btn">发送剪贴板</button>
+    </div>
+  </section>
+
+  <section class="compose">
+    <textarea id="text" rows="2" placeholder="输入文字，回车发送（Shift+回车换行）"></textarea>
+    <button id="sendText" class="btn primary" disabled>发送</button>
+  </section>
+
+  <section class="history">
+    <div class="bar">
+      <span class="bar-title">收发记录</span>
+      <span class="spacer"></span>
+      <button id="openDir" class="link">打开接收文件夹</button>
+      <button id="clear" class="link">清空</button>
+    </div>
+    <ul id="list"></ul>
+    <p id="empty" class="empty">还没有记录。发点什么试试。</p>
+  </section>
+</main>
+
+<div id="overlay" class="overlay"><div>松手发送</div></div>
+<div id="toast" class="toast"></div>
+
+<dialog id="settings">
+  <form id="settingsForm" method="dialog">
+    <h2>设置</h2>
+    <p id="settingsHint" class="hint"></p>
+
+    <label>配对码<small>在另一台已配好的电脑上点“复制配对码”，粘贴到这里即可，不用手填下面两项</small>
+      <div class="inline"><input id="pair" type="text" placeholder="w2m:…" spellcheck="false" autocomplete="off"><button type="button" id="applyPair" class="btn">应用</button></div>
+    </label>
+    <label>服务器地址
+      <input id="server" type="text" placeholder="https://…" spellcheck="false" autocomplete="off">
+    </label>
+    <label>口令
+      <div class="inline"><input id="token" type="password" spellcheck="false" autocomplete="off"><button type="button" id="showToken" class="btn">显示</button></div>
+    </label>
+    <div class="inline gap">
+      <button type="button" id="test" class="btn">测试连接</button>
+      <button type="button" id="copyPair" class="btn">复制配对码</button>
+      <span id="testResult" class="test-result"></span>
+    </div>
+
+    <hr>
+    <label>本机名称<small>对方收到东西时看到的名字</small>
+      <input id="deviceName" type="text" maxlength="40">
+    </label>
+    <label>接收文件夹
+      <div class="inline"><input id="downloadDir" type="text" readonly><button type="button" id="chooseDir" class="btn">更改</button></div>
+    </label>
+    <label>发送剪贴板的全局快捷键<small>例如 Ctrl+Alt+S、Alt+Shift+V；留空则不启用</small>
+      <input id="hotkey" type="text" spellcheck="false" autocomplete="off">
+    </label>
+    <div class="devices">
+      <div class="devices-title">其他设备<small>换机或重装后留下的旧设备可以移除</small></div>
+      <ul id="deviceList"></ul>
+    </div>
+    <label class="check"><input id="autoCopy" type="checkbox"> 收到文字、截图时自动放进剪贴板</label>
+    <label class="check"><input id="notify" type="checkbox"> 收到内容时弹出系统通知</label>
+    <label class="check"><input id="showFloat" type="checkbox"> 显示悬浮窗</label>
+    <label class="check"><input id="openAtLogin" type="checkbox"> 开机自动启动</label>
+
+    <div class="actions">
+      <span id="version" class="version"></span>
+      <button type="button" id="cancelSettings" class="btn">取消</button>
+      <button type="submit" id="saveSettings" class="btn primary">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="main.js"></script>
+</body>
+</html>

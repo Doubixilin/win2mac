@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'">
+<title>Win2Mac 悬浮窗</title>
+<link rel="stylesheet" href="float.css">
+</head>
+<body>
+<div id="ball" class="ball offline" title="拖到这里发送；点击打开主界面；右键更多">
+  <svg class="ring" viewBox="0 0 64 64"><circle id="ring" cx="32" cy="32" r="29"/></svg>
+  <svg class="glyph g-idle" viewBox="0 0 48 48"><path d="M10 18h26M28 10l8 8-8 8"/><path d="M38 32H12M20 24l-8 8 8 8"/></svg>
+  <svg class="glyph g-drop" viewBox="0 0 48 48"><path d="M24 10v26M12 24l12 12 12-12"/></svg>
+  <svg class="glyph g-ok" viewBox="0 0 48 48"><path d="M12 25l9 9 16-18"/></svg>
+  <svg class="glyph g-err" viewBox="0 0 48 48"><path d="M15 15l18 18M33 15L15 33"/></svg>
+  <span id="badge" class="badge"></span>
+  <span id="dot" class="dot"></span>
+</div>
+<script src="float.js"></script>
+</body>
+</html>

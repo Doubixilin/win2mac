@@ -1,0 +1,9 @@
+node_modules/
+app/dist/
+server/data/
+# 部署时生成的口令、配对码，不入库
+secrets/
+*.log
+.DS_Store
+*.bak*
+*.tmp
