@@ -104,4 +104,7 @@ window.addEventListener('contextmenu', (e) => { e.preventDefault(); w2m.floatMen
 w2m.on('status', renderStatus);
 w2m.on('entry', onEntry);
 w2m.on('unseen', renderUnseen);
+// 有别的设备在远程操作这台电脑时，悬浮球闪一下橙色，让坐在电脑前的人知道
+let remoteTimer;
+w2m.on('control', () => { ball.classList.add('remote'); clearTimeout(remoteTimer); remoteTimer = setTimeout(() => ball.classList.remove('remote'), 2500); });
 w2m.state().then((s) => { renderStatus(s.status); renderUnseen(s.unseen); });

@@ -86,6 +86,19 @@
       <div class="devices-title">其他设备<small>换机或重装后留下的旧设备可以移除</small></div>
       <ul id="deviceList"></ul>
     </div>
+    <div class="devices">
+      <div class="devices-title">远程控制（MCP）<small>允许哪些设备上的 AI 操作这台电脑。授权前，请核对下面的指纹和对方设置里显示的“本机指纹”一致。</small></div>
+      <div class="fp">本机指纹：<b id="myFp"></b></div>
+      <ul id="controlList"></ul>
+      <div class="inline gap">
+        <button type="button" id="registerMcp" class="btn">接入本机的 AI 客户端</button>
+        <button type="button" id="copyMcp" class="btn">复制 MCP 配置</button>
+        <button type="button" id="copyMcpToml" class="btn">复制 Codex 配置</button>
+        <button type="button" id="openControlLog" class="btn">操作日志</button>
+      </div>
+      <p id="controlRecent" class="recent"></p>
+    </div>
+    <hr>
     <label class="check"><input id="autoCopy" type="checkbox"> 收到文字、截图时自动放进剪贴板</label>
     <label class="check"><input id="notify" type="checkbox"> 收到内容时弹出系统通知</label>
     <label class="check"><input id="showFloat" type="checkbox"> 显示悬浮窗</label>

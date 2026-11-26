@@ -212,8 +212,42 @@ function renderDevices() {
   }
 }
 
+const LEVELS = [['none', '不允许'], ['read', '只读'], ['full', '完全控制']];
+async function renderControl() {
+  const { list, fingerprint, log } = await w2m.controllers();
+  $('myFp').textContent = fingerprint;
+  const ul = $('controlList');
+  ul.replaceChildren();
+  if (!list.length) ul.append(el('li', 'none', '还没有其他设备连接过'));
+  for (const d of list) {
+    const li = el('li');
+    li.append(el('span', 'name', d.name + (d.gone ? '（已不在设备列表）' : '')));
+    const sel = el('select');
+    for (const [v, label] of LEVELS) { const o = el('option', '', label); o.value = v; sel.append(o); }
+    sel.value = d.level;
+    sel.disabled = !d.supported;
+    sel.addEventListener('change', async () => {
+      const level = sel.value;
+      if (level === 'full' && !confirm(`允许“${d.name}”上的 AI 在这台电脑上执行任意命令、读写任意文件？\n\n对方指纹：${d.fp}\n请确认它和对方 Win2Mac 设置里显示的“本机指纹”一致。`)) { sel.value = d.level; return; }
+      const r = await w2m.setController(d.id, level);
+      if (!r.ok) toast(r.error);
+      renderControl();
+    });
+    li.append(sel);
+    const sub = !d.supported ? ['sub warn', '对方版本太旧，不支持远程控制']
+      : d.keyChanged ? ['sub warn', `对方密钥已变（现在 ${d.fp}，授权时 ${d.grantedFp}），需重新选择权限`]
+      : ['sub', '指纹 ' + d.fp];
+    li.append(el('span', sub[0], sub[1]));
+    ul.append(li);
+  }
+  $('controlRecent').textContent = log.length
+    ? '最近的远程操作：\n' + log.slice(0, 5).map((a) => `${when(a.time)} ${a.fromName} ${a.ok ? '✓' : '✗'} ${a.method} ${a.summary}`.trim()).join('\n')
+    : '';
+}
+
 function openSettings(hint) {
   renderDevices();
+  renderControl();
   for (const k of FIELDS) $(k).value = config[k] ?? '';
   for (const k of CHECKS) $(k).checked = !!config[k];
   $('pair').value = '';
@@ -255,6 +289,16 @@ $('copyPair').addEventListener('click', async () => {
   await w2m.copyText(config.pairCode);
   showTest(true, '配对码已复制，注意它等同于口令');
 });
+$('registerMcp').addEventListener('click', async () => {
+  if (!confirm('把 Win2Mac 的 MCP 服务登记到本机已安装的 AI 客户端（Kimi Code、ZCode、Codex、Claude 桌面版）？\n\n只会在它们的配置里新增或更新名为 win2mac 的一项，改之前会留备份。客户端重启或新开会话后生效。')) return;
+  const res = await w2m.mcpRegister();
+  const done = res.filter((r) => r.ok).map((r) => r.label);
+  const failed = res.filter((r) => !r.ok && !r.skipped).map((r) => `${r.label}（${r.message}）`);
+  showTest(!failed.length, (done.length ? `已接入：${done.join('、')}` : '没有找到已安装的客户端') + (failed.length ? `；失败：${failed.join('、')}` : ''));
+});
+$('copyMcp').addEventListener('click', async () => { await w2m.copyText((await w2m.mcpConfig()).json); showTest(true, 'MCP 配置已复制，粘贴到 AI 客户端的 MCP 设置里'); });
+$('copyMcpToml').addEventListener('click', async () => { await w2m.copyText((await w2m.mcpConfig()).toml); showTest(true, '已复制，粘贴到 ~/.codex/config.toml 末尾'); });
+$('openControlLog').addEventListener('click', () => w2m.openControlLog());
 $('settingsForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const patch = {};
@@ -268,7 +312,8 @@ $('settingsForm').addEventListener('submit', async (e) => {
 
 // ---------- 初始化 ----------
 
-w2m.on('status', (s) => { status = s; renderStatus(); if (dlg.open) renderDevices(); });
+w2m.on('status', (s) => { status = s; renderStatus(); if (dlg.open) { renderDevices(); renderControl(); } });
+w2m.on('control', () => { if (dlg.open) renderControl(); });
 w2m.on('entry', onEntry);
 w2m.on('config', (c) => { config = c; });
 w2m.on('open-settings', (hint) => openSettings(hint));

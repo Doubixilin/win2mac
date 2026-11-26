@@ -19,6 +19,7 @@ const MAX_JSON = 8 * 2 ** 20;
 const MAX_CHUNK = 64 * 2 ** 20;
 const DEVICE_FORGET_MS = 30 * 86400e3;
 const UPLOAD_STALE_MS = 86400e3;
+const DIRECT_TTL_MS = 6 * 3600e3;
 
 if (TOKEN.length < 24) {
   console.error('W2M_TOKEN 未设置或太短（至少 24 个字符）');
@@ -50,8 +51,10 @@ function saveNow() {
   fs.renameSync(tmp, STATE_FILE);
 }
 
-/** deviceId -> Set<ServerResponse> */
+/** deviceId -> Set<ServerResponse>：客户端主连接，收内容推送和远程控制请求 */
 const streams = new Map();
+/** deviceId -> Set<ServerResponse>：控制端（MCP 进程）连接，只收设备列表和控制应答，不算“在线” */
+const controlStreams = new Map();
 
 const isId = (s) => typeof s === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(s);
 const newId = () => crypto.randomBytes(9).toString('base64url');
@@ -94,16 +97,18 @@ function touchDevice(req) {
   if (!isId(id)) return null;
   let name = id;
   try { name = decodeURIComponent(String(req.headers['x-device-name'] || id)).slice(0, 80); } catch {}
+  // 设备的签名公钥（远程控制用）。中转只负责转告，信不信由各设备自己在本地决定。
+  const key = String(req.headers['x-device-key'] || '').slice(0, 200);
   const known = state.devices[id];
-  if (!known || known.name !== name || Date.now() - known.lastSeen > 60e3) {
-    state.devices[id] = { name, lastSeen: Date.now() };
+  if (!known || known.name !== name || (key && known.key !== key) || Date.now() - known.lastSeen > 60e3) {
+    state.devices[id] = { ...known, name, lastSeen: Date.now(), ...(key ? { key } : {}) };
     saveSoon();
   }
   return id;
 }
 
 function deviceList() {
-  return Object.entries(state.devices).map(([id, d]) => ({ id, name: d.name, online: (streams.get(id)?.size || 0) > 0 }));
+  return Object.entries(state.devices).map(([id, d]) => ({ id, name: d.name, key: d.key || '', online: (streams.get(id)?.size || 0) > 0 }));
 }
 
 function publicItem(it) {
@@ -128,8 +133,14 @@ function broadcast(event, data, exceptDevice) {
 }
 
 // 该条目是否应投递给这台设备
+function broadcastPresence(exceptDevice) {
+  const data = { devices: deviceList() };
+  broadcast('presence', data, exceptDevice);
+  for (const set of controlStreams.values()) for (const res of set) sse(res, 'presence', data);
+}
+
 function wants(it, deviceId) {
-  if (it.status !== 'ready' || it.from === deviceId) return false;
+  if (it.status !== 'ready' || it.from === deviceId || it.direct) return false;
   if (it.pending === null) return true; // 发送时还没有其他已知设备：谁先来谁收
   return it.pending.includes(deviceId);
 }
@@ -150,6 +161,8 @@ async function removeItem(id, notify) {
 }
 
 function publish(it) {
+  // 定向文件（远程控制里的文件收发）：只给指定设备按编号来取，不走推送
+  if (it.direct) { it.pending = [it.direct]; it.status = 'ready'; saveSoon(); return; }
   const others = Object.keys(state.devices).filter((d) => d !== it.from);
   it.pending = others.length ? others : null;
   it.status = 'ready';
@@ -160,7 +173,7 @@ function publish(it) {
 
 // ---------- 路由处理 ----------
 
-function handleEvents(req, res, device) {
+function handleEvents(req, res, device, url) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -168,13 +181,25 @@ function handleEvents(req, res, device) {
     Connection: 'keep-alive',
   });
   res.write(': ok\n\n');
+  if (url.searchParams.get('role') === 'control') {
+    if (!controlStreams.has(device)) controlStreams.set(device, new Set());
+    controlStreams.get(device).add(res);
+    sse(res, 'hello', { devices: deviceList(), now: Date.now() });
+    const beat = setInterval(() => res.write(': hb\n\n'), 20e3);
+    req.on('close', () => {
+      clearInterval(beat);
+      const set = controlStreams.get(device);
+      if (set) { set.delete(res); if (!set.size) controlStreams.delete(device); }
+    });
+    return;
+  }
   if (!streams.has(device)) streams.set(device, new Set());
   streams.get(device).add(res);
 
   sse(res, 'hello', { devices: deviceList(), now: Date.now() });
   const backlog = Object.values(state.items).filter((it) => wants(it, device)).sort((a, b) => a.createdAt - b.createdAt);
   for (const it of backlog) sse(res, 'item', publicItem(it));
-  broadcast('presence', { devices: deviceList() }, device);
+  broadcastPresence(device);
 
   const hb = setInterval(() => res.write(': hb\n\n'), 20e3);
   const close = () => {
@@ -182,7 +207,7 @@ function handleEvents(req, res, device) {
     const set = streams.get(device);
     if (set) { set.delete(res); if (!set.size) streams.delete(device); }
     if (state.devices[device]) { state.devices[device].lastSeen = Date.now(); saveSoon(); }
-    broadcast('presence', { devices: deviceList() });
+    broadcastPresence();
   };
   req.on('close', close);
 }
@@ -215,6 +240,10 @@ async function handleCreate(req, res, device) {
       it.total += size;
     }
     it.dirs = (Array.isArray(body.dirs) ? body.dirs : []).map(cleanRel).filter(Boolean);
+    if (body.direct !== undefined) {
+      if (!isId(body.direct) || it.files.length !== 1) return send(res, 400, { error: '定向文件参数无效' });
+      it.direct = body.direct;
+    }
     if (!it.files.length && !it.dirs.length) return send(res, 400, { error: '没有可发送的内容' });
     if (usedBytes() + it.total > MAX_BYTES) return send(res, 507, { error: '服务器中转空间不足' });
     await fsp.mkdir(blobDir(it.id), { recursive: true });
@@ -272,6 +301,7 @@ async function handleCommit(req, res, device, it) {
 
 async function handleDownload(req, res, device, it, idx) {
   if (it.status !== 'ready') return send(res, 409, { error: '条目未就绪' });
+  if (it.direct && device !== it.direct && device !== it.from) return send(res, 403, { error: '无权访问' });
   const f = it.files?.[idx];
   if (!f) return send(res, 404, { error: '文件不存在' });
   let start = 0;
@@ -298,6 +328,24 @@ async function handleAck(req, res, device, it) {
   send(res, 200, { ok: true });
 }
 
+// 远程控制的请求与应答。中转不解析内容，只按目标设备转发；真伪由两端用设备密钥验签。
+async function handleRpc(req, res, device, sub) {
+  const body = await readJson(req);
+  if (!isId(body.to) || typeof body.payload !== 'string' || typeof body.sig !== 'string') return send(res, 400, { error: '参数无效' });
+  const msg = { from: device, payload: body.payload, sig: body.sig };
+  if (sub === 'reply') {
+    const set = controlStreams.get(body.to);
+    if (!set?.size) return send(res, 410, { error: '请求方已断开' });
+    for (const r of set) sse(r, 'rpc-reply', msg);
+    return send(res, 200, { ok: true });
+  }
+  if (sub) return send(res, 404, { error: 'not found' });
+  const set = streams.get(body.to);
+  if (!set?.size) return send(res, 409, { error: '设备不在线' });
+  sse([...set][0], 'rpc', msg); // 只发给一个连接，同一设备多开时不会重复执行
+  send(res, 200, { ok: true });
+}
+
 async function forgetDevice(id) {
   delete state.devices[id];
   for (const it of Object.values(state.items)) {
@@ -312,7 +360,7 @@ async function handleForget(res, id) {
   if (!state.devices[id]) return send(res, 404, { error: '设备不存在' });
   if (streams.has(id)) return send(res, 409, { error: '设备正在线，不能移除' });
   await forgetDevice(id);
-  broadcast('presence', { devices: deviceList() });
+  broadcastPresence();
   send(res, 200, { ok: true });
 }
 
@@ -329,7 +377,8 @@ async function route(req, res) {
   const device = touchDevice(req);
   if (!device) return send(res, 400, { error: '缺少设备标识' });
 
-  if (parts[1] === 'events' && req.method === 'GET') return handleEvents(req, res, device);
+  if (parts[1] === 'events' && req.method === 'GET') return handleEvents(req, res, device, url);
+  if (parts[1] === 'rpc' && req.method === 'POST' && parts.length <= 3) return handleRpc(req, res, device, parts[2]);
   if (parts[1] !== 'items') return send(res, 404, { error: 'not found' });
   if (parts.length === 2 && req.method === 'POST') return handleCreate(req, res, device);
 
@@ -365,7 +414,8 @@ server.keepAliveTimeout = 75e3;
 async function sweep() {
   const now = Date.now();
   for (const it of Object.values(state.items)) {
-    const stale = it.status === 'uploading' ? now - it.createdAt > UPLOAD_STALE_MS : now - it.createdAt > TTL_MS;
+    const ttl = it.status === 'uploading' ? UPLOAD_STALE_MS : it.direct ? DIRECT_TTL_MS : TTL_MS;
+    const stale = now - it.createdAt > ttl;
     if (stale) await removeItem(it.id, true);
   }
   for (const [id, d] of Object.entries(state.devices)) {

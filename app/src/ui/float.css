@@ -33,3 +33,7 @@ body { display: grid; place-items: center; }
 
 .badge { position: absolute; right: -2px; top: -2px; min-width: 18px; height: 18px; padding: 0 5px; box-sizing: border-box; border-radius: 9px; background: #ff4d4f; color: #fff; font: 600 11px/18px -apple-system, "Segoe UI", sans-serif; text-align: center; display: none; pointer-events: none; }
 .badge.show { display: block; }
+
+.ball.remote { background: linear-gradient(140deg, #f59e0b, #ea580c); }
+.ball.remote::after { content: ''; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid #f59e0b; animation: pulse 1.2s ease-out infinite; pointer-events: none; }
+@keyframes pulse { from { opacity: .9; transform: scale(.92); } to { opacity: 0; transform: scale(1.12); } }

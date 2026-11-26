@@ -49,6 +49,7 @@ const srv = spawn(process.execPath, [path.join(__dirname, '../server/server.js')
 });
 
 const { Relay } = require('../app/src/core.js');
+const { ControlClient, generateKeys, fingerprint } = require('../app/src/control.js');
 const main = require('../app/src/main.js');
 
 async function shot(win, name) {
@@ -68,7 +69,9 @@ async function cdpDrop(win, x, y, data) {
 
 app.whenReady().then(async () => {
   const savedClipboard = await clipboard.readText().catch(() => '');
-  const peer = new Relay({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', downloadDir: dirs.peer });
+  const peerKeys = generateKeys();
+  const peer = new Relay({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', downloadDir: dirs.peer, publicKey: peerKeys.publicKey });
+  const ctl = new ControlClient({ server: SERVER, token: TOKEN, deviceId: 'smoke-win-001', deviceName: '办公Win', publicKey: peerKeys.publicKey, privateKey: peerKeys.privateKey, pinsFile: path.join(ROOT, 'pins.json') });
   const got = [];
   peer.on('received', (e, item) => got.push({ ...e, clip: item.clip }));
   const next = async (pred, what) => {
@@ -211,6 +214,55 @@ app.whenReady().then(async () => {
       await js(main.mainWin, `document.getElementById('cancelSettings').click()`);
     });
 
+    await step('远程控制：设置里授权只读 → 对端能读不能执行；悬浮球有提示', async () => {
+      ctl.start();
+      await ctl.ready();
+      await assert.rejects(ctl.call('家里Mac', 'sys.info'), (e) => e.code === 'forbidden');
+      await js(main.mainWin, `document.getElementById('btnSettings').click()`);
+      await until(() => js(main.mainWin, `document.querySelectorAll('#controlList select').length === 1`), 5e3, '授权列表');
+      const shown = await js(main.mainWin, `({ mine: document.getElementById('myFp').textContent, peer: document.querySelector('#controlList .sub').textContent })`);
+      assert.equal(shown.mine, fingerprint(main.config.keyPublic));
+      assert.equal(shown.peer, '指纹 ' + fingerprint(peerKeys.publicKey));
+      await js(main.mainWin, `(() => { const s = document.querySelector('#controlList select'); s.value = 'read'; s.dispatchEvent(new Event('change')); })()`);
+      await until(() => main.config.controllers['smoke-win-001']?.level === 'read', 5e3, '授权生效');
+      const info = await ctl.call('家里Mac', 'sys.info');
+      assert.equal(info.home, os.homedir());
+      await clipboard.writeText('被控端剪贴板内容');
+      assert.equal((await ctl.call('家里Mac', 'clipboard.read')).text, '被控端剪贴板内容');
+      await assert.rejects(ctl.call('家里Mac', 'exec', { command: 'echo no' }), (e) => e.code === 'read-only');
+      assert.ok(await js(main.floatWin, `document.getElementById('ball').classList.contains('remote')`), '悬浮球应提示正在被远程操作');
+      await until(() => js(main.mainWin, `document.getElementById('controlRecent').textContent.includes('sys.info')`), 5e3, '设置里显示最近操作');
+      await js(main.mainWin, `document.getElementById('myFp').scrollIntoView({ block: 'center' })`);
+      await sleep(300);
+      await shot(main.mainWin, '6-settings-control.png');
+      await js(main.mainWin, `document.getElementById('cancelSettings').click()`);
+    });
+
+    await step('远程控制：完全控制 → 执行命令、写剪贴板、打开文件；私钥不进渲染进程；操作有日志', async () => {
+      assert.deepEqual(main.setController('smoke-win-001', 'full'), { ok: true });
+      const r = await ctl.call('家里Mac', 'exec', { command: 'echo 远程执行成功 && whoami' });
+      assert.equal(r.exitCode, 0);
+      assert.ok(r.stdout.includes('远程执行成功') && r.stdout.includes(os.userInfo().username));
+      await ctl.call('家里Mac', 'clipboard.write', { text: '控制端写入的文字' });
+      assert.equal(await clipboard.readText(), '控制端写入的文字');
+      await assert.rejects(ctl.call('家里Mac', 'open', { target: path.join(ROOT, 'no-such-file') }), /路径不存在/);
+      const st = await js(main.mainWin, `w2m.state().then(s => ({ hasPriv: 'keyPrivate' in s.config, fp: s.config.fingerprint }))`);
+      assert.equal(st.hasPriv, false);
+      const log = fs.readFileSync(path.join(dirs.user, 'control.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      assert.ok(log.some((a) => a.method === 'exec' && a.ok && a.fromName === '办公Win'));
+      assert.ok(log.some((a) => a.method === 'exec' && !a.ok));
+      assert.deepEqual(main.setController('smoke-win-001', 'none'), { ok: true });
+      await assert.rejects(ctl.call('家里Mac', 'sys.info'), (e) => e.code === 'forbidden');
+    });
+
+    await step('MCP 配置里的程序和脚本路径都存在', async () => {
+      const { json, toml } = main.mcpConfig();
+      const entry = JSON.parse(json).mcpServers.win2mac;
+      assert.ok(fs.existsSync(entry.command) && fs.existsSync(entry.args[0]));
+      assert.equal(entry.env.ELECTRON_RUN_AS_NODE, '1');
+      assert.ok(toml.includes('[mcp_servers.win2mac]'));
+    });
+
     await step('配对码可以还原出服务器和口令；悬浮窗位置可保存', async () => {
       const code = await js(main.mainWin, `w2m.state().then(s => s.config.pairCode)`);
       assert.match(code, /^w2m:/);
@@ -230,6 +282,7 @@ app.whenReady().then(async () => {
   } finally {
     await clipboard.writeText(savedClipboard).catch(() => {});
     peer.stop();
+    ctl.stop();
     srv.kill();
     fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
     const failed = results.filter((r) => !r.ok).length;

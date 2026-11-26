@@ -1,7 +1,7 @@
 'use strict';
 const {
   app, BrowserWindow, Tray, Menu, ipcMain, dialog, clipboard, nativeImage,
-  globalShortcut, Notification, shell, screen, ClipboardItem,
+  globalShortcut, Notification, shell, screen, ClipboardItem, desktopCapturer, systemPreferences,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -10,6 +10,11 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { fileURLToPath } = require('url');
 const { Relay } = require('./core');
+const { ControlHost, generateKeys, fingerprint } = require('./control');
+
+// AI 客户端正常是用 ELECTRON_RUN_AS_NODE=1 直接跑 mcp.js 的。万一某个客户端不传环境变量，
+// 程序会被当成普通应用启动并带着 mcp.js 这个参数——这时不开窗口、不抢单实例锁，就在主进程里提供 MCP 服务。
+const mcpMode = process.argv.slice(1).some((a) => a === '--mcp' || /[\\/]mcp\.js$/.test(a));
 
 // 测试时用独立的数据目录，这样可以同时开多个实例
 if (process.env.W2M_USER_DATA) app.setPath('userData', process.env.W2M_USER_DATA);
@@ -41,6 +46,8 @@ function defaults() {
     hotkey: 'Ctrl+Alt+S',
     autoCopy: true, notify: true, showFloat: true, openAtLogin: true,
     floatPos: null,
+    // 远程控制：本机授权了哪些设备（按设备编号），每项 { name, key, level: 'read' | 'full' }
+    controllers: {},
   };
 }
 
@@ -56,7 +63,16 @@ function writeJson(p, data) {
 function loadConfig() {
   const saved = readJson(file('config.json'), {});
   config = { ...defaults(), ...saved };
-  if (!saved.deviceId) saveConfig();
+  let dirty = !saved.deviceId;
+  // 设备密钥：远程控制的请求和应答都靠它签名，私钥只留在本机
+  if (!config.keyPrivate || !config.keyPublic) {
+    const k = generateKeys();
+    config.keyPrivate = k.privateKey;
+    config.keyPublic = k.publicKey;
+    dirty = true;
+  }
+  if (!config.controllers || typeof config.controllers !== 'object') config.controllers = {};
+  if (dirty) saveConfig();
 }
 function saveConfig() { writeJson(file('config.json'), config); }
 
@@ -385,8 +401,11 @@ function registerHotkey() {
 }
 
 function publicConfig() {
-  return { ...config, pairCode: pairCode(), hotkeyActive: !!activeHotkey || !config.hotkey };
+  const { keyPrivate, ...rest } = config; // 私钥不出主进程
+  return { ...rest, pairCode: pairCode(), hotkeyActive: !!activeHotkey || !config.hotkey, fingerprint: fingerprint(config.keyPublic) };
 }
+
+const relayOpts = () => ({ ...config, publicKey: config.keyPublic });
 
 function applyLoginItem() {
   if (!app.isPackaged) return; // 开发模式下注册的是 electron 本体，没有意义
@@ -407,12 +426,98 @@ function applyConfig(patch) {
   if (config.openAtLogin !== before.openAtLogin) applyLoginItem();
   if (config.showFloat !== before.showFloat) setFloatVisible(config.showFloat);
   if (['server', 'token', 'deviceName', 'downloadDir'].some((k) => config[k] !== before[k])) {
-    relay.configure(config);
+    relay.configure(relayOpts());
     relay.start();
   }
   refreshTray();
   broadcast('config', publicConfig());
   return { ok: true, hotkeyOk };
+}
+
+// ---------- 远程控制 ----------
+
+const controlExtras = {
+  async clipboardRead() {
+    const c = await readClipboard();
+    return { text: c.text, files: c.files, hasImage: !!c.image };
+  },
+  async clipboardWrite({ text }) {
+    if (typeof text !== 'string') throw new Error('缺少文字');
+    await clipboard.writeText(text);
+    return { ok: true };
+  },
+  async screenshot({ display = 0 }) {
+    if (isMac && systemPreferences.getMediaAccessStatus('screen') === 'denied') {
+      throw new Error('这台 Mac 没有给 Win2Mac“录屏”权限。请在 系统设置 → 隐私与安全性 → 录屏与系统录音 里打开 Win2Mac，然后重启 Win2Mac。');
+    }
+    const displays = screen.getAllDisplays();
+    const index = Math.min(Math.max(Number(display) || 0, 0), displays.length - 1);
+    const d = displays[index];
+    const scale = Math.min(1, 1600 / d.size.width); // 缩到 1600 宽以内，够看清又不至于太大
+    const thumbnailSize = { width: Math.round(d.size.width * scale), height: Math.round(d.size.height * scale) };
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
+    const src = sources.find((x) => String(x.display_id) === String(d.id)) || sources[index] || sources[0];
+    if (!src || src.thumbnail.isEmpty()) {
+      throw new Error(isMac ? '截图失败：多半是还没授予“录屏”权限（系统设置 → 隐私与安全性 → 录屏与系统录音），授权后需重启 Win2Mac。' : '截图失败');
+    }
+    const size = src.thumbnail.getSize();
+    return { data: src.thumbnail.toJPEG(72).toString('base64'), mimeType: 'image/jpeg', width: size.width, height: size.height, index, count: displays.length };
+  },
+  async open({ target }) {
+    if (typeof target !== 'string' || !target) throw new Error('缺少要打开的目标');
+    if (/^https?:\/\//i.test(target)) { await shell.openExternal(target); return { opened: target }; }
+    const p = target === '~' ? os.homedir() : /^~[\\/]/.test(target) ? path.join(os.homedir(), target.slice(2)) : path.resolve(os.homedir(), target);
+    if (!fs.existsSync(p)) throw new Error(`路径不存在：${p}`);
+    const err = await shell.openPath(p);
+    if (err) throw new Error(err);
+    return { opened: p };
+  },
+};
+
+const controlLog = []; // 最近的远程操作，新的在前
+function logControl(act) {
+  controlLog.unshift(act);
+  if (controlLog.length > 200) controlLog.length = 200;
+  fs.appendFile(file('control.log'), JSON.stringify({ ...act, time: new Date(act.time).toISOString() }) + '\n', () => {});
+  broadcast('control', act);
+}
+
+/** 设置页里“远程控制”那张表：每台其他设备的指纹、当前授权档位，以及密钥是否和授权时不一样了 */
+function controllerList() {
+  const peers = relay.peers;
+  const rows = peers.map((p) => {
+    const c = config.controllers[p.id];
+    return {
+      id: p.id, name: p.name, online: p.online, supported: !!p.key, fp: fingerprint(p.key),
+      level: c ? c.level : 'none', keyChanged: !!(c && p.key && c.key !== p.key), grantedFp: c ? fingerprint(c.key) : '',
+    };
+  });
+  // 已授权但服务器上已经没有的设备也列出来，方便撤销
+  for (const [id, c] of Object.entries(config.controllers)) {
+    if (!peers.some((p) => p.id === id)) rows.push({ id, name: c.name, online: false, supported: true, fp: fingerprint(c.key), level: c.level, keyChanged: false, grantedFp: fingerprint(c.key), gone: true });
+  }
+  return rows;
+}
+
+function setController(id, level) {
+  if (level === 'none') { delete config.controllers[id]; saveConfig(); return { ok: true }; }
+  if (!['read', 'full'].includes(level)) return { ok: false, error: '无效的权限档位' };
+  const peer = relay.peers.find((p) => p.id === id);
+  const prev = config.controllers[id];
+  // 授权绑定的是“此刻看到的这把公钥”；对方不在列表里时只允许调整已有授权的档位
+  const key = peer?.key || prev?.key;
+  if (!key) return { ok: false, error: '对方的 Win2Mac 版本太旧，还不支持远程控制' };
+  config.controllers[id] = { name: peer?.name || prev?.name || id, key, level, grantedAt: Date.now() };
+  saveConfig();
+  return { ok: true };
+}
+
+function mcpConfig() {
+  const command = process.execPath;
+  const script = path.join(__dirname, 'mcp.js');
+  const json = JSON.stringify({ mcpServers: { win2mac: { command, args: [script], env: { ELECTRON_RUN_AS_NODE: '1' } } } }, null, 2);
+  const toml = `[mcp_servers.win2mac]\ncommand = '${command}'\nargs = ['${script}']\nenv = { ELECTRON_RUN_AS_NODE = "1" }\n`;
+  return { json, toml };
 }
 
 // ---------- IPC ----------
@@ -453,6 +558,16 @@ function setupIpc() {
   h('remove-entry', (id) => { history = history.filter((x) => x.id !== id); saveHistorySoon(); return true; });
   h('clear-history', () => { history = history.filter((x) => x.state === 'active'); saveHistorySoon(); return history; });
   h('cancel', (id) => { relay.cancel(id); return true; });
+  h('controllers', () => ({ list: controllerList(), fingerprint: fingerprint(config.keyPublic), log: controlLog.slice(0, 20) }));
+  h('set-controller', (id, level) => setController(String(id), String(level)));
+  h('mcp-config', () => mcpConfig());
+  h('mcp-register', () => require('./mcp-register').register());
+  h('open-control-log', () => {
+    const p = file('control.log');
+    if (!fs.existsSync(p)) fs.writeFileSync(p, '');
+    shell.showItemInFolder(p);
+    return true;
+  });
   h('remove-device', async (id) => {
     try { await relay.removeDevice(String(id)); return { ok: true }; }
     catch (e) { return { ok: false, error: e.message || '移除失败' }; }
@@ -471,7 +586,7 @@ function setupIpc() {
 // ---------- 启动 ----------
 
 function setupRelay() {
-  relay = new Relay(config);
+  relay = new Relay(relayOpts());
   relay.on('status', (s) => { broadcast('status', s); refreshTray(); });
   relay.on('entry', upsertEntry);
   relay.on('received', onReceived);
@@ -480,10 +595,21 @@ function setupRelay() {
     if (e) upsertEntry({ ...e, delivered: true, deliveredTo: byName });
   });
   relay.on('warn', (e) => console.error('relay:', e?.message || e));
+  new ControlHost({
+    relay,
+    identity: () => ({ deviceId: config.deviceId, privateKey: config.keyPrivate }),
+    controllers: () => config.controllers,
+    extras: controlExtras,
+    onActivity: logControl,
+  }).attach();
   relay.start();
 }
 
-if (!app.requestSingleInstanceLock()) {
+if (mcpMode) {
+  app.dock?.hide();
+  app.on('window-all-closed', () => {});
+  require('./mcp').main();
+} else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', showMain);
@@ -521,5 +647,6 @@ if (!app.requestSingleInstanceLock()) {
 module.exports = {
   get relay() { return relay; }, get mainWin() { return mainWin; }, get floatWin() { return floatWin; },
   get config() { return config; }, get history() { return history; },
-  sendClipboard, readClipboard, writeClipboardImage, applyConfig, showMain,
+  sendClipboard, readClipboard, writeClipboardImage, applyConfig, showMain, setController, controllerList, mcpConfig,
+  get controlLog() { return controlLog; },
 };

@@ -2,7 +2,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (name) => (...args) => ipcRenderer.invoke(name, ...args);
-const EVENTS = ['status', 'entry', 'config', 'unseen', 'open-settings'];
+const EVENTS = ['status', 'entry', 'config', 'unseen', 'open-settings', 'control'];
 
 contextBridge.exposeInMainWorld('w2m', {
   state: invoke('state'),
@@ -24,6 +24,11 @@ contextBridge.exposeInMainWorld('w2m', {
   clearHistory: invoke('clear-history'),
   cancel: invoke('cancel'),
   removeDevice: invoke('remove-device'),
+  controllers: invoke('controllers'),
+  setController: invoke('set-controller'),
+  mcpConfig: invoke('mcp-config'),
+  mcpRegister: invoke('mcp-register'),
+  openControlLog: invoke('open-control-log'),
 
   /** 拖进来的 File 对象对应的磁盘路径；不是磁盘文件（比如网页里拖出的图片）时返回空串 */
   pathFor: (f) => { try { return webUtils.getPathForFile(f) || ''; } catch { return ''; } },

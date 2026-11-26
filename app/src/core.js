@@ -46,7 +46,8 @@ class Canceled extends Error { constructor() { super('已取消'); this.canceled
 class Relay extends EventEmitter {
   constructor(opts) {
     super();
-    this.opts = { server: '', token: '', deviceId: '', deviceName: '', downloadDir: '' };
+    // publicKey：本设备的签名公钥，随请求告知中转；role='control' 表示这是控制端连接，只收设备列表和控制应答
+    this.opts = { server: '', token: '', deviceId: '', deviceName: '', downloadDir: '', publicKey: '', role: '' };
     this.connected = false;
     this.devices = [];
     this.lastError = '';
@@ -107,6 +108,7 @@ class Relay extends EventEmitter {
         Authorization: 'Bearer ' + this.opts.token,
         'X-Device': this.opts.deviceId,
         'X-Device-Name': encodeURIComponent(this.opts.deviceName || this.opts.deviceId),
+        ...(this.opts.publicKey ? { 'X-Device-Key': this.opts.publicKey } : {}),
         ...headers,
       },
     });
@@ -182,7 +184,7 @@ class Relay extends EventEmitter {
 
   _listen(gen) {
     return new Promise((resolve, reject) => {
-      const req = this._request('GET', '/api/events', { headers: { Accept: 'text/event-stream' } });
+      const req = this._request('GET', '/api/events' + (this.opts.role ? '?role=' + this.opts.role : ''), { headers: { Accept: 'text/event-stream' } });
       this._stream = req;
       req.setTimeout(0);
       let watchdog = null;
@@ -236,6 +238,8 @@ class Relay extends EventEmitter {
       this._inQ = this._inQ.then(() => this._receive(data)).catch((e) => this.emit('warn', e));
     } else if (event === 'delivered') {
       this.emit('delivered', data);
+    } else if (event === 'rpc' || event === 'rpc-reply') {
+      this.emit(event, data);
     }
   }
 
@@ -450,6 +454,54 @@ class Relay extends EventEmitter {
     catch (e) { if (e.status !== 404) this.emit('warn', e); }
   }
 
+  // ---------- 远程控制用的底层通道 ----------
+
+  sendRpc(to, payload, sig) { return this._json('POST', '/api/rpc', { to, payload, sig }); }
+  replyRpc(to, payload, sig) { return this._json('POST', '/api/rpc/reply', { to, payload, sig }); }
+
+  /** 把一个文件定向传给某台设备（不进对方的接收目录和记录），返回它在中转上的编号 */
+  async uploadDirect(abs, to) {
+    const st = await fsp.stat(abs);
+    if (!st.isFile()) throw new Error('只能传单个文件');
+    const tag = { id: 'direct-' + Math.random().toString(36).slice(2), total: st.size, silent: true };
+    const created = await this._retry(tag.id, () => this._json('POST', '/api/items', {
+      kind: 'files', direct: to, files: [{ rel: path.basename(abs), size: st.size }],
+    }));
+    try {
+      let offset = 0;
+      while (offset < st.size) {
+        const len = Math.min(CHUNK, st.size - offset), start = offset;
+        const r = await this._retry(tag.id, async () => {
+          try { return await this._putChunk(tag, created.id, 0, abs, start, len, start); }
+          catch (e) { if (e.status === 409 && Number.isInteger(e.body?.size)) return { size: e.body.size }; throw e; }
+        });
+        offset = r.size;
+      }
+      await this._retry(tag.id, () => this._json('POST', `/api/items/${created.id}/commit`));
+    } catch (e) {
+      this._json('DELETE', `/api/items/${created.id}`).catch(() => {});
+      throw e;
+    }
+    return { id: created.id, size: st.size, name: path.basename(abs) };
+  }
+
+  /** 取回一个定向文件，写到指定路径，取完即从中转删除 */
+  async downloadDirect(rid, size, dest) {
+    const tag = { id: 'direct-' + rid, total: size, silent: true };
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    const part = dest + '.w2mpart';
+    await fsp.rm(part, { force: true });
+    try {
+      await this._retry(tag.id, () => this._download(tag, rid, 0, size, part, 0));
+      if (size === 0) await fsp.writeFile(part, '');
+      await fsp.rename(part, dest);
+    } catch (e) {
+      await fsp.rm(part, { force: true }).catch(() => {});
+      throw e;
+    }
+    await this._ack(rid);
+  }
+
   removeDevice(id) { return this._json('DELETE', `/api/devices/${encodeURIComponent(id)}`); }
 
   // ---------- 条目状态 ----------
@@ -467,6 +519,7 @@ class Relay extends EventEmitter {
   }
 
   _progress(entry, done) {
+    if (entry.silent) return;
     entry.done = Math.min(done, entry.total);
     const now = Date.now();
     if (now - (entry._t || 0) < 120) return;
