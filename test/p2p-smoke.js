@@ -124,6 +124,28 @@ async function main() {
       assert.equal(blobs(), 0);
     });
 
+    await step('复用直连发送超过 256 KiB 的中文目录清单', async () => {
+      const name = '大清单';
+      const source = path.join(src, name);
+      fs.mkdirSync(source);
+      const dirs = Array.from({ length: 1400 }, (_, i) => i + '-' + '目录'.repeat(32));
+      for (const dir of dirs) fs.mkdirSync(path.join(source, dir));
+      assert.ok(Buffer.byteLength(JSON.stringify(dirs.map((dir) => name + '/' + dir))) > 256 * 1024);
+      const filename = '中文样本.bin';
+      fs.writeFileSync(path.join(source, filename), crypto.randomBytes(300 * 1024));
+      assert.ok((await A.call('status')).peers.find((peer) => peer.id === B.deviceId)?.route);
+      const id = await A.call('send', { paths: [source] });
+      const out = await done(A, id);
+      assert.equal(out.state, 'done', out.error);
+      assert.equal(out.via, 'direct');
+      const entry = await received(B, name);
+      assert.equal(entry.via, 'direct');
+      const children = fs.readdirSync(entry.paths[0], { withFileTypes: true });
+      assert.deepEqual(children.filter((child) => child.isDirectory()).map((child) => child.name).sort(), dirs.sort());
+      assert.equal(sha(path.join(entry.paths[0], filename)), sha(path.join(source, filename)));
+      assert.equal(blobs(), 0);
+    });
+
     await step('一方在设置里关掉直连后，文件照常经中转送达', async () => {
       await A.call('config', { patch: { direct: false } });
       const id = await B.call('send', { paths: [folder] });

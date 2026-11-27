@@ -424,6 +424,8 @@ function publicConfig() {
 const relayOpts = () => ({
   server: config.server, token: config.token, deviceId: config.deviceId, deviceName: config.deviceName,
   downloadDir: config.downloadDir, publicKey: signingKey ? config.keyPublic : '',
+  receiptFile: file('batch-receipts-' + crypto.createHash('sha256')
+    .update(JSON.stringify([config.server, config.token, config.deviceId])).digest('hex') + '.json'),
 });
 
 function applyLoginItem() {

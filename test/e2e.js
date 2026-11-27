@@ -58,8 +58,8 @@ async function main() {
     catch (e) { results.push(['FAIL', name]); console.log('FAIL', name, '\n   ', e.stack); }
   };
 
-  const mk = (id, name, dl) => new Relay({ server: SERVER, token: TOKEN, deviceId: id, deviceName: name, downloadDir: dl });
-  const A = mk('dev-aaaaaa', '办公Win', dirs.a);
+  const mk = (id, name, dl, opts = {}) => new Relay({ server: SERVER, token: TOKEN, deviceId: id, deviceName: name, downloadDir: dl, ...opts });
+  const A = mk('dev-aaaaaa', '办公Win', dirs.a, { receiptFile: path.join(root, 'a-receipts.json') });
   let B = mk('dev-bbbbbb', '家里Mac', dirs.b);
   for (const r of [A, B]) r.on('warn', (e) => console.log('  warn:', e.message));
 
@@ -75,6 +75,8 @@ async function main() {
       B.start();
       await waitFor(A, 'status', (s) => s.peers.some((p) => p.online && p.name === '家里Mac'));
       assert.ok(B.connected);
+      assert.equal(B.peers.find((p) => p.id === A.opts.deviceId).batchReceipts, true);
+      assert.equal(A.peers.find((p) => p.id === B.opts.deviceId).batchReceipts, false);
     });
 
     await step('文本 A→B（含中文、emoji、换行）', async () => {
@@ -100,7 +102,8 @@ async function main() {
       B.on('entry', onEntry);
       const got = waitFor(B, 'received', (e) => e.kind === 'files');
       const out = A.sendPaths([big]);
-      const [entry] = await got;
+      const [entry, item] = await got;
+      assert.match(item.batchId, /^[A-Za-z0-9_-]{6,40}$/);
       B.off('entry', onEntry);
       assert.equal(entry.paths.length, 1);
       assert.equal(path.basename(entry.paths[0]), '大文件.bin');
@@ -196,6 +199,8 @@ async function main() {
       });
       let r = await raw('POST', '/api/items', JSON.stringify({ kind: 'files', files: [{ rel: '../../etc/passwd', size: 3 }] }));
       assert.equal(r.status, 400);
+      r = await raw('POST', '/api/items', JSON.stringify({ kind: 'files', batchId: 'short', files: [{ rel: 'a.txt', size: 0 }] }));
+      assert.equal(r.status, 400);
       r = await raw('POST', '/api/items', JSON.stringify({ kind: 'files', files: [{ rel: 'a/b.txt', size: 6 }] }));
       const { id } = await r.json();
       assert.equal((await raw('PUT', `/api/items/${id}/files/0?offset=0`, 'abc')).status, 200);
@@ -206,7 +211,8 @@ async function main() {
       assert.equal((await raw('PUT', `/api/items/${id}/files/0?offset=3`, 'def')).status, 200);
       const got = waitFor(B, 'received', (e) => e.kind === 'files');
       assert.equal((await raw('POST', `/api/items/${id}/commit`)).status, 200);
-      const [entry] = await got;
+      const [entry, item] = await got;
+      assert.equal(item.batchId, undefined);
       assert.equal(await fsp.readFile(path.join(entry.paths[0], 'b.txt'), 'utf8'), 'abcdef');
       // 别的设备不能删、不能写这个条目
       assert.equal((await raw('GET', '/api/items/nonexistent-id/files/0')).status, 404);
@@ -267,7 +273,8 @@ async function main() {
       const text = await A._json('POST', '/api/items', { kind: 'text', text: 'survive restart' });
       await restart();
       const bytes = Buffer.from('bytes after restart');
-      const file = await A._json('POST', '/api/items', { kind: 'files', files: [{ rel: '恢复.txt', size: bytes.length }] });
+      const batchId = 'restart-batch';
+      const file = await A._json('POST', '/api/items', { kind: 'files', batchId, files: [{ rel: '恢复.txt', size: bytes.length }] });
       await restart();
       const upload = await fetch(SERVER + `/api/items/${file.id}/files/0`, {
         method: 'PUT', body: bytes, headers: { Authorization: 'Bearer ' + TOKEN, 'X-Device': A.opts.deviceId },
@@ -278,8 +285,9 @@ async function main() {
       const textDelivery = waitFor(B, 'received', (e) => e.remoteId === text.id, 5000);
       const fileDelivery = waitFor(B, 'received', (e) => e.remoteId === file.id, 5000);
       B.start();
-      const [[message], [entry]] = await Promise.all([textDelivery, fileDelivery]);
+      const [[message], [entry, item]] = await Promise.all([textDelivery, fileDelivery]);
       assert.equal(message.text, 'survive restart');
+      assert.equal(item.batchId, batchId);
       assert.deepEqual(await fsp.readFile(entry.paths[0]), bytes);
     });
 

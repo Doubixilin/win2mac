@@ -17,32 +17,37 @@ class WebRtcEngine extends EventEmitter {
     this._releaseTimer = null;
     ipcMain.on('p2p:evt', (e, evt) => {
       if (!this.win || this.win.isDestroyed() || e.sender !== this.win.webContents || !evt) return;
-      if (evt.ev === 'ready') this._onReady?.();
+      if (evt.ev === 'ready') this._finishStartup?.();
       else this.emit('evt', evt);
     });
   }
 
-  ready() {
+  async ready() {
     clearTimeout(this._releaseTimer);
     if (this._ready) return this._ready;
-    this._ready = new Promise((resolve, reject) => {
-      const win = this.win = new BrowserWindow({
-        show: false, width: 200, height: 100, skipTaskbar: true, focusable: false,
-        webPreferences: {
-          preload: path.join(__dirname, 'p2p-preload.js'), contextIsolation: true, nodeIntegration: false,
-          backgroundThrottling: false, // 窗口一直不可见，不能让它被降速
-        },
-      });
-      const timer = setTimeout(() => reject(new Error('直连组件启动超时')), 15e3);
-      this._onReady = () => { clearTimeout(timer); resolve(); };
+    const win = this.win = new BrowserWindow({
+      show: false, width: 200, height: 100, skipTaskbar: true, focusable: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'p2p-preload.js'), contextIsolation: true, nodeIntegration: false,
+        backgroundThrottling: false, // 窗口一直不可见，不能让它被降速
+      },
+    });
+    const ready = this._ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this._down(win, new Error('直连组件启动超时')), 15e3);
+      this._finishStartup = (error) => {
+        clearTimeout(timer);
+        this._finishStartup = null;
+        if (error) reject(error); else resolve();
+      };
+    });
+    try {
       win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
       win.webContents.on('will-navigate', (e) => e.preventDefault());
       win.webContents.on('render-process-gone', () => this._down(win));
       win.on('closed', () => this._down(win));
-      win.loadFile(path.join(__dirname, 'ui', 'p2p.html')).catch(reject);
-    });
-    this._ready.catch(() => this._down(this.win));
-    return this._ready;
+      win.loadFile(path.join(__dirname, 'ui', 'p2p.html')).catch((error) => this._down(win, error));
+    } catch (error) { this._down(win, error); }
+    return ready;
   }
 
   send(cmd) {
@@ -52,15 +57,17 @@ class WebRtcEngine extends EventEmitter {
   /** 调用方表示暂时用不着了 */
   release() {
     clearTimeout(this._releaseTimer);
-    this._releaseTimer = setTimeout(() => this._down(this.win), RELEASE_MS);
+    const win = this.win;
+    if (!win) return;
+    this._releaseTimer = setTimeout(() => this._down(win), RELEASE_MS);
     this._releaseTimer.unref?.();
   }
 
-  _down(win) {
+  _down(win, error) {
     if (!win || win !== this.win) return;
+    this._finishStartup?.(error || new Error('直连组件已退出'));
     this.win = null;
     this._ready = null;
-    this._onReady = null;
     clearTimeout(this._releaseTimer);
     if (!win.isDestroyed()) win.destroy();
     this.emit('evt', { ev: 'down' });

@@ -31,6 +31,7 @@ const STATE_FILE = path.join(DATA, 'state.json');
 fs.mkdirSync(BLOBS, { recursive: true });
 
 const isId = (s) => typeof s === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(s);
+const isBatchId = (s) => typeof s === 'string' && /^[A-Za-z0-9_-]{6,40}$/.test(s);
 const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 function validStoredItem(id, it) {
@@ -39,6 +40,7 @@ function validStoredItem(id, it) {
   if (it.kind === 'text') return it.status === 'ready' && typeof it.text === 'string';
   return it.kind === 'files' && ['ready', 'uploading'].includes(it.status)
     && Number.isSafeInteger(it.total) && it.total >= 0
+    && (it.batchId === undefined || isBatchId(it.batchId))
     && Array.isArray(it.files) && it.files.every((f) => isRecord(f) && cleanRel(f.rel) && Number.isSafeInteger(f.size) && f.size >= 0)
     && (it.dirs === undefined || (Array.isArray(it.dirs) && it.dirs.every(cleanRel)))
     && (it.direct === undefined || isId(it.direct));
@@ -152,14 +154,19 @@ function touchDevice(req) {
 }
 
 function deviceList() {
-  return Object.entries(state.devices).map(([id, d]) => ({ id, name: d.name, key: d.key || '', online: (streams.get(id)?.size || 0) > 0 }));
+  return Object.entries(state.devices).map(([id, d]) => {
+    const clients = streams.get(id);
+    const online = !!clients?.size;
+    const batchReceipts = online && [...clients].every((res) => res.batchReceipts);
+    return { id, name: d.name, key: d.key || '', online, batchReceipts };
+  });
 }
 
 function publicItem(it) {
   return {
     id: it.id, from: it.from, fromName: state.devices[it.from]?.name || it.fromName || it.from,
     kind: it.kind, text: it.text, files: it.files, dirs: it.dirs, total: it.total,
-    clip: !!it.clip, createdAt: it.createdAt,
+    clip: !!it.clip, createdAt: it.createdAt, batchId: it.batchId,
   };
 }
 
@@ -235,6 +242,7 @@ function handleEvents(req, res, device, url) {
     });
     return;
   }
+  res.batchReceipts = req.headers['x-w2m-batch-receipts'] === '1';
   if (!streams.has(device)) streams.set(device, new Set());
   streams.get(device).add(res);
 
@@ -271,6 +279,10 @@ async function handleCreate(req, res, device) {
     return send(res, 200, { id: it.id });
   }
   if (body.kind === 'files') {
+    if (body.batchId !== undefined) {
+      if (!isBatchId(body.batchId)) return send(res, 400, { error: '文件批次编号无效' });
+      it.batchId = body.batchId;
+    }
     if (!Array.isArray(body.files) || body.files.length > 100000) return send(res, 400, { error: '文件列表无效' });
     it.files = [];
     for (const f of body.files) {

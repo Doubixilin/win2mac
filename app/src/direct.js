@@ -23,7 +23,7 @@ const PRIMARY_STUN = 2;
 const PUBLIC_DNS = ['223.5.5.5', '119.29.29.29', '1.1.1.1'];
 const CLOCK_SKEW_MS = 5 * 60e3;
 const SIGNAL_MS = 6e3;                    // 这么久没收到对方的信令，就认为它不支持直连
-const CONNECT_MS = 10e3;                  // 打洞最长等待；打得通的话一般两三秒内就通了
+const HANDSHAKE_MS = 30e3;                // 包括双方冷启动、STUN 地址解析和打洞的整次上限
 const LINK_OPEN_MS = 8e3;
 const IDLE_MS = 5 * 60e3;                 // 没有传输这么久就断开，下次要用再连
 const RETRY_UNSUPPORTED_MS = 10 * 60e3;   // 对方不支持：过这么久再试
@@ -127,9 +127,9 @@ async function resolveStun(servers, { timeoutMs = 5000 } = {}) {
 
 /** 一条有序、可靠的消息通道。消息是字符串（控制）或 Buffer（数据）。 */
 class Link extends EventEmitter {
-  constructor(hub, id, peerId, route) {
+  constructor(hub, id, peerId, route, maxMessageSize) {
     super();
-    Object.assign(this, { hub, id, peerId, route, closed: false });
+    Object.assign(this, { hub, id, peerId, route, maxMessageSize, closed: false });
     this._seq = 0;
     this._pending = new Map();
   }
@@ -228,78 +228,104 @@ class DirectHub extends EventEmitter {
   }
   infoOf(peerId) { return this._peers.get(peerId)?.info || null; }
 
-  async open(peerId, { timeoutMs = SIGNAL_MS + CONNECT_MS + LINK_OPEN_MS } = {}) {
+  async open(peerId, { timeoutMs = HANDSHAKE_MS + LINK_OPEN_MS } = {}) {
     if (this._disposed || !this.enabled()) throw new Error('直连未启用');
-    let timer;
+    let timer, linkTimer;
     const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('直连超时')), timeoutMs); });
     try {
-      await Promise.race([this._connect(peerId), late]);
       const p = this._peer(peerId);
+      const attempt = await Promise.race([this._connect(p), late]);
+      if (p.attempt !== attempt || this._disposed || !this.enabled()) throw new Error('直连已重置');
       const link = new Link(this, newId(), peerId, p.route);
       this._links.set(link.id, link);
       clearTimeout(p.idle);
       const opened = new Promise((resolve, reject) => { link._open = { resolve, reject }; });
       opened.catch(() => {});
-      this.engine.send({ op: 'open-link', peer: peerId, link: link.id });
-      try { await Promise.race([opened, late]); }
-      catch (e) { link.close(); throw e; }
+      try {
+        this.engine.send({ op: 'open-link', peer: peerId, link: link.id });
+        const openingTimeout = new Promise((_, reject) => {
+          linkTimer = setTimeout(() => reject(new Error('打开直连通道超时')), LINK_OPEN_MS);
+        });
+        await Promise.race([opened, late, openingTimeout]);
+        if (link.closed || p.attempt !== attempt || this._disposed || !this.enabled()) throw new Error('直连已重置');
+      } catch (e) { link.close(); throw e; }
       link._open = null;
       return link;
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); clearTimeout(linkTimer); }
   }
 
   _peer(id) {
-    if (!this._peers.has(id)) this._peers.set(id, { id, state: 'idle', sid: '', route: '', retryAt: 0, why: '', outbox: [], sending: false });
+    if (!this._peers.has(id)) this._peers.set(id, { id, state: 'idle', attempt: null, route: '', retryAt: 0, why: '', outbox: [], sending: false });
     return this._peers.get(id);
   }
 
-  _connect(peerId, incoming) {
-    const p = this._peer(peerId);
-    if (p.state === 'connected' && !incoming) return Promise.resolve();
-    if (!incoming && p.retryAt > Date.now()) return Promise.reject(new Error(p.why || '直连暂不可用'));
-    if (!p.connecting) {
-      p.connecting = this._establish(p, incoming).finally(() => { p.connecting = null; });
-      p.connecting.catch(() => {});
-    }
-    return p.connecting;
-  }
-
-  async _establish(p, incoming) {
+  _connect(p, offer, supported = false) {
+    if (p.attempt) return p.attempt.promise;
+    if (!offer && p.retryAt > Date.now()) return Promise.reject(new Error(p.why || '直连暂不可用'));
     const me = this.identity();
-    if (!me) throw new Error('本机没有设备密钥，不能直连');
+    if (!me || this._disposed || !this.enabled()) return Promise.reject(new Error('直连未启用'));
+    const offerer = me.deviceId < p.id;
+    // 支持跨通道批次回执的在线版本也支持直连，DNS 或信令慢时不应判作旧版本。
+    const advertised = this.relay.peers?.some((d) => d.id === p.id && d.online && d.batchReceipts === true);
+    // attempt 的身份也是代次。关闭时立即移除，旧的异步准备、超时和引擎事件不能影响后续连接。
+    const attempt = {
+      offerer, offer, sid: offer?.sid || (offerer ? newId() : ''), wantId: offerer ? '' : newId(),
+      supported: !!(advertised || supported || offer), candidates: [], ice: null, started: false,
+    };
+    p.attempt = attempt;
     p.state = 'connecting';
-    p.gotSignal = false;
-    let signalTimer, connectTimer;
-    try {
-      await this.engine.ready();
-      const done = new Promise((resolve, reject) => { p.wait = { resolve, reject }; });
-      done.catch(() => {});
-      signalTimer = setTimeout(() => {
-        if (!p.gotSignal) p.wait?.reject(Object.assign(new Error('对方没有回应直连请求（可能是旧版本）'), { unsupported: true }));
-      }, SIGNAL_MS);
-      connectTimer = setTimeout(() => p.wait?.reject(new Error('两边的网络没能直接打通')), SIGNAL_MS + CONNECT_MS);
-      if (incoming) await this._answer(p, incoming);
-      else if (me.deviceId < p.id) await this._offer(p);
-      else await this._signal(p, 'want', '', null); // 固定由编号小的一方发起，避免两边同时发起撞车
-      await done;
+    const done = new Promise((resolve, reject) => { attempt.resolve = resolve; attempt.reject = reject; });
+    const deadline = setTimeout(() => attempt.reject(new Error('两边的网络没能直接打通')), HANDSHAKE_MS);
+    attempt.promise = done.then(() => {
+      if (p.attempt !== attempt || this._disposed || !this.enabled()) throw new Error('直连已重置');
       p.state = 'connected';
       p.connectedAt = Date.now();
       p.retryAt = 0;
       p.fails = 0;
       this._touch(p.id);
       this.emit('route', p.id, p.route);
-    } catch (e) {
-      this._closePeer(p, true);
-      if (!e.unsupported) p.fails = (p.fails || 0) + 1;
-      p.retryAt = Date.now() + (e.unsupported ? RETRY_UNSUPPORTED_MS : RETRY_FAILED_MS[Math.min(p.fails, RETRY_FAILED_MS.length) - 1]);
-      this.emit('diag', p.id, `没连上：${e.message}；${Math.round((p.retryAt - Date.now()) / 1000)} 秒后才会再试`);
-      p.why = e.message;
+      return attempt;
+    }).catch((e) => {
+      if (p.attempt === attempt) {
+        this._closePeer(p, true);
+        if (!e.unsupported) p.fails = (p.fails || 0) + 1;
+        p.retryAt = Date.now() + (e.unsupported ? RETRY_UNSUPPORTED_MS : RETRY_FAILED_MS[Math.min(p.fails, RETRY_FAILED_MS.length) - 1]);
+        p.why = e.message;
+        this.emit('diag', p.id, `没连上：${e.message}；${Math.round((p.retryAt - Date.now()) / 1000)} 秒后才会再试`);
+      }
       throw e;
-    } finally {
-      clearTimeout(signalTimer);
-      clearTimeout(connectTimer);
-      p.wait = null;
-    }
+    }).finally(() => { clearTimeout(deadline); clearTimeout(attempt.signalTimer); });
+
+    this._prepare(p, attempt).catch(attempt.reject);
+    return attempt.promise;
+  }
+
+  async _prepare(p, attempt) {
+    const [, ice] = await Promise.all([this.engine.ready(), this._iceServers()]);
+    if (p.attempt !== attempt) return;
+    attempt.ice = ice;
+    if (attempt.offerer || attempt.offer) this._startEngine(p, attempt);
+    else this._requestSignal(p, attempt, 'want', attempt.wantId, null);
+  }
+
+  _startEngine(p, attempt) {
+    if (!attempt.ice || attempt.started) return;
+    attempt.started = true;
+    const peer = p.id, sid = attempt.sid;
+    this.engine.send({ op: 'connect', peer, sid, role: attempt.offerer ? 'offer' : 'answer', ...attempt.ice });
+    if (attempt.offer) this.engine.send({ op: 'signal', peer, sid, type: 'offer', data: attempt.offer.sdp });
+    for (const data of attempt.candidates) this.engine.send({ op: 'signal', peer, sid, type: 'cand', data });
+    attempt.candidates.length = 0;
+  }
+
+  // 从介绍人接到已准备好的请求开始计算回应期限。双方已确认支持时，只受整次握手期限约束。
+  _requestSignal(p, attempt, type, sid, data) {
+    this._signal(p, type, sid, data).then(() => {
+      if (p.attempt !== attempt || p.state !== 'connecting' || attempt.supported) return;
+      attempt.signalTimer = setTimeout(() => {
+        if (!attempt.supported) attempt.reject(Object.assign(new Error('对方没有回应直连请求（可能是旧版本）'), { unsupported: true }));
+      }, SIGNAL_MS);
+    }, attempt.reject);
   }
 
   async _iceServers() {
@@ -315,29 +341,18 @@ class DirectHub extends EventEmitter {
     return { iceServers: urls.length ? [{ urls }] : [], primary };
   }
 
-  async _offer(p) {
-    p.sid = newId();
-    this.engine.send({ op: 'connect', peer: p.id, sid: p.sid, role: 'offer', ...(await this._iceServers()) });
-  }
-
-  async _answer(p, { sid, sdp }) {
-    p.sid = sid;
-    p.gotSignal = true;
-    const ice = await this._iceServers();
-    if (p.sid !== sid) return;
-    this.engine.send({ op: 'connect', peer: p.id, sid, role: 'answer', ...ice });
-    this.engine.send({ op: 'signal', peer: p.id, sid, type: 'offer', data: sdp });
-  }
-
   _closePeer(p, notify) {
-    const had = p.state !== 'idle' && p.sid;
-    if (had) this.engine.send({ op: 'close-peer', peer: p.id });
-    if (had && notify) this._signal(p, 'bye', p.sid, null).catch(() => {});
-    clearTimeout(p.idle);
+    const attempt = p.attempt;
+    p.attempt = null;
     p.state = 'idle';
-    p.sid = '';
     p.route = '';
-    p.wait?.reject(new Error('直连已重置'));
+    p.info = null;
+    clearTimeout(p.idle);
+    if (attempt) {
+      attempt.reject(new Error('直连已重置'));
+      if (attempt.started) this.engine.send({ op: 'close-peer', peer: p.id });
+      if (attempt.sid && notify) this._signal(p, 'bye', attempt.sid, null).catch(() => {});
+    }
     for (const link of [...this._links.values()]) if (link.peerId === p.id) link._closed();
     this.emit('route', p.id, '');
     if (![...this._peers.values()].some((x) => x.state !== 'idle')) this.engine.release();
@@ -358,7 +373,11 @@ class DirectHub extends EventEmitter {
       const was = this._online.get(d.id);
       this._online.set(d.id, d.online);
       // 对方重新上线（升级了、换了网络）就把“上次没成”的记忆清掉，马上可以再试
-      if (d.online && was === false) { const p = this._peers.get(d.id); if (p) { p.retryAt = 0; p.fails = 0; } }
+      const p = this._peers.get(d.id);
+      if (d.online && p) {
+        if (p.attempt && d.batchReceipts === true) p.attempt.supported = true;
+        if (was === false) { p.retryAt = 0; p.fails = 0; }
+      }
     }
   }
 
@@ -367,7 +386,7 @@ class DirectHub extends EventEmitter {
   /** 同一台设备的信令按顺序发；排队中的候选地址合并成一条 */
   _signal(p, type, sid, data) {
     return new Promise((resolve, reject) => {
-      p.outbox.push({ type, sid, data, resolve, reject });
+      p.outbox.push({ type, sid, data, resolve, reject, attempt: p.attempt });
       this._flush(p);
     });
   }
@@ -378,11 +397,12 @@ class DirectHub extends EventEmitter {
     while (p.outbox.length) {
       const batch = [p.outbox.shift()];
       if (batch[0].type === 'cand') {
-        while (p.outbox[0]?.type === 'cand' && p.outbox[0].sid === batch[0].sid) batch.push(p.outbox.shift());
+        while (batch.length < 64 && p.outbox[0]?.type === 'cand' && p.outbox[0].sid === batch[0].sid) batch.push(p.outbox.shift());
       }
       const first = batch[0];
       const data = first.type === 'cand' ? batch.map((x) => x.data) : first.data;
       try {
+        if (first.attempt && first.attempt !== p.attempt && first.type !== 'no') throw new Error('直连已重置');
         const me = this.identity();
         if (!me) throw new Error('本机没有设备密钥');
         const payload = JSON.stringify({ w2m: 'p2p', v: 1, from: me.deviceId, to: p.id, ts: Date.now(), sid: first.sid, type: first.type, data });
@@ -413,36 +433,45 @@ class DirectHub extends EventEmitter {
     if (s.type === 'want' || s.type === 'offer') {
       if (!this.enabled()) { this._signal(p, 'no', s.sid || '', null).catch(() => {}); return; }
     }
+    const attempt = p.attempt;
     if (s.type === 'want') {
       if (!(me.deviceId < p.id)) return;
-      if (p.state === 'connecting') return;                         // 已经在发起了
       if (p.state === 'connected') {
-        if (p.connectedAt >= s.ts) return;                          // 这条请求比现有连接还旧
-        this._closePeer(p, false);                                  // 对方那头的连接已经没了，重建
+        if (p.connectedAt >= s.ts) return;
+        this._closePeer(p, false);
       }
       p.retryAt = 0;
-      this._connect(p.id).catch(fail);
+      if (p.attempt) p.attempt.supported = true;
+      else this._connect(p, null, true).catch(fail);
     } else if (s.type === 'offer') {
-      if (me.deviceId < p.id || typeof s.sid !== 'string' || typeof s.data !== 'string') return;
-      const incoming = { sid: s.sid, sdp: s.data };
-      if (p.connecting && p.state === 'connecting' && !p.gotSignal) { this._answer(p, incoming).catch(fail); return; }
-      if (p.state !== 'idle') this._closePeer(p, false);
-      const start = () => this._connect(p.id, incoming).catch(fail);
-      if (p.connecting) p.connecting.then(start, start); else start();
-    } else if (s.type === 'answer') {
-      if (s.sid !== p.sid || typeof s.data !== 'string') return;
-      p.gotSignal = true;
-      this.engine.send({ op: 'signal', peer: p.id, sid: p.sid, type: 'answer', data: s.data });
-    } else if (s.type === 'cand') {
-      if (s.sid !== p.sid || !Array.isArray(s.data)) return;
-      for (const c of s.data.slice(0, 64)) this.engine.send({ op: 'signal', peer: p.id, sid: p.sid, type: 'cand', data: c });
-    } else if (s.type === 'no') {
-      p.wait?.reject(Object.assign(new Error('对方关闭了直连'), { unsupported: true }));
-    } else if (s.type === 'bye') {
-      if (s.sid && s.sid === p.sid) {
-        if (p.wait) p.wait.reject(new Error('对方断开了直连'));
-        else this._closePeer(p, false);
+      if (me.deviceId < p.id || typeof s.sid !== 'string' || !s.sid || typeof s.data !== 'string') return;
+      if (attempt?.sid === s.sid) return;
+      const offer = { sid: s.sid, sdp: s.data };
+      if (attempt && !attempt.sid) {
+        attempt.sid = offer.sid;
+        attempt.offer = offer;
+        attempt.supported = true;
+        this._startEngine(p, attempt);
+      } else {
+        if (attempt) this._closePeer(p, false);
+        this._connect(p, offer).catch(fail);
       }
+    } else if (s.type === 'answer') {
+      if (!attempt?.started || s.sid !== attempt.sid || !attempt.offerer || typeof s.data !== 'string') return;
+      attempt.supported = true;
+      this.engine.send({ op: 'signal', peer: p.id, sid: attempt.sid, type: 'answer', data: s.data });
+    } else if (s.type === 'cand') {
+      if (!attempt || !s.sid || s.sid !== attempt.sid || !Array.isArray(s.data) || !s.data.length) return;
+      attempt.supported = true;
+      for (const data of s.data.slice(0, 64)) {
+        if (attempt.started) this.engine.send({ op: 'signal', peer: p.id, sid: attempt.sid, type: 'cand', data });
+        else if (attempt.candidates.length < 256) attempt.candidates.push(data);
+      }
+    } else if (s.type === 'no') {
+      if (attempt && s.sid && (s.sid === attempt.sid || s.sid === attempt.wantId)) attempt.reject(Object.assign(new Error('对方关闭了直连'), { unsupported: true }));
+    } else if (s.type === 'bye' && attempt && s.sid && s.sid === attempt.sid) {
+      if (p.state === 'connecting') attempt.reject(new Error('对方断开了直连'));
+      else this._closePeer(p, false);
     }
   }
 
@@ -451,7 +480,7 @@ class DirectHub extends EventEmitter {
   _onEngine(evt) {
     if (evt.ev === 'down') {
       for (const p of this._peers.values()) {
-        if (p.wait) p.wait.reject(new Error('直连组件意外退出'));
+        if (p.state === 'connecting') p.attempt.reject(new Error('直连组件意外退出'));
         else if (p.state !== 'idle') this._closePeer(p, true);
       }
       return;
@@ -459,19 +488,21 @@ class DirectHub extends EventEmitter {
     if (evt.ev === 'diag') { this.emit('diag', evt.peer, String(evt.text)); return; }
     if (evt.ev === 'signal' || evt.ev === 'peer-up' || evt.ev === 'peer-down' || evt.ev === 'link-in') {
       const p = this._peers.get(evt.peer);
-      if (!p || (evt.ev !== 'link-in' && evt.sid !== p.sid)) return;
-      if (evt.ev === 'signal') this._signal(p, evt.type, evt.sid, evt.data).catch(() => {});
-      else if (evt.ev === 'peer-up') {
+      const attempt = p?.attempt;
+      if (!attempt?.started || evt.sid !== attempt.sid) return;
+      if (evt.ev === 'signal') {
+        if (evt.type === 'offer') this._requestSignal(p, attempt, evt.type, evt.sid, evt.data);
+        else this._signal(p, evt.type, evt.sid, evt.data).catch(() => {});
+      } else if (evt.ev === 'peer-up') {
         p.route = evt.route || 'wan';
         p.info = evt.info;
         this.emit('diag', p.id, `已连上：${JSON.stringify(evt.info)}`);
-        p.wait?.resolve();
-      }
-      else if (evt.ev === 'peer-down') {
-        if (p.wait) p.wait.reject(new Error('两边的网络没能直接打通'));
+        attempt.resolve();
+      } else if (evt.ev === 'peer-down') {
+        if (p.state === 'connecting') attempt.reject(new Error('两边的网络没能直接打通'));
         else this._closePeer(p, true);
       } else if (p.state === 'connected' || p.state === 'connecting') {
-        const link = new Link(this, evt.link, p.id, p.route);
+        const link = new Link(this, evt.link, p.id, p.route, evt.maxMessageSize);
         this._links.set(link.id, link);
         clearTimeout(p.idle);
         if (this.enabled() && this.listenerCount('link')) this.emit('link', link, p.id);
@@ -481,7 +512,11 @@ class DirectHub extends EventEmitter {
     }
     const link = this._links.get(evt.link);
     if (!link) return;
-    if (evt.ev === 'link-open') link._open?.resolve();
+    if (evt.ev === 'link-open' && evt.sid !== this._peers.get(link.peerId)?.attempt?.sid) return;
+    if (evt.ev === 'link-open') {
+      link.maxMessageSize = evt.maxMessageSize;
+      link._open?.resolve();
+    }
     else if (evt.ev === 'link-sent') { const w = link._pending.get(evt.seq); link._pending.delete(evt.seq); w?.resolve(); }
     else if (evt.ev === 'link-close') link._closed();
     else if (evt.ev === 'link-msg') {

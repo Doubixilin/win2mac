@@ -102,13 +102,16 @@ async function describeRoute(pc) {
   return { route: lan ? 'lan' : 'wan', info: { local: brief(local), remote: brief(remote) } };
 }
 
-function wireLink(dc, peerId, incoming) {
+function wireLink(dc, peerId, st, incoming) {
   const id = dc.label;
   dc._peer = peerId;
   dc.binaryType = 'arraybuffer';
   dc.bufferedAmountLowThreshold = BUFFER_LOW;
   links.set(id, dc);
-  const opened = () => emit(incoming ? { ev: 'link-in', peer: peerId, link: id } : { ev: 'link-open', link: id });
+  const opened = () => emit({
+    ev: incoming ? 'link-in' : 'link-open', peer: peerId, sid: st.sid, link: id,
+    maxMessageSize: st.pc.sctp?.maxMessageSize,
+  });
   if (dc.readyState === 'open') opened(); else dc.onopen = opened;
   dc.onmessage = (e) => emit({ ev: 'link-msg', link: id, data: e.data });
   dc.onclose = () => { if (links.get(id) === dc) { links.delete(id); emit({ ev: 'link-close', link: id }); } };
@@ -146,7 +149,7 @@ async function connect({ peer, sid, role, iceServers, primary }) {
   };
   pc.ondatachannel = (e) => {
     if (e.channel.label === 'ctl') ctlOpen(e.channel);
-    else wireLink(e.channel, peer, true);
+    else wireLink(e.channel, peer, st, true);
   };
 
   if (role === 'offer') {
@@ -206,7 +209,7 @@ window.w2mP2P.onCmd((cmd) => {
     else if (cmd.op === 'open-link') {
       const st = peers.get(cmd.peer);
       if (!st) throw new Error('没有到这台设备的连接');
-      wireLink(st.pc.createDataChannel(cmd.link, { ordered: true }), cmd.peer, false);
+      wireLink(st.pc.createDataChannel(cmd.link, { ordered: true }), cmd.peer, st, false);
     } else if (cmd.op === 'send') send(cmd).catch(fail);
     else if (cmd.op === 'close-link') { const dc = links.get(cmd.link); if (dc) dc.close(); }
   } catch (e) { fail(e); }

@@ -45,6 +45,13 @@ class FakeLink extends EventEmitter {
   send(data) {
     if (this.closed) return Promise.reject(new Error('直连已断开'));
     const copy = typeof data === 'string' ? data : Buffer.from(data);
+    if (this.net.dropReply && typeof data === 'string' && this.net.dropReply.type === JSON.parse(data).t) {
+      const fault = this.net.dropReply;
+      this.net.dropReply = null;
+      this._break();
+      fault.onDrop?.();
+      return Promise.reject(new Error('模拟直连回执丢失'));
+    }
     if (typeof data !== 'string') {
       this.bytes += data.length;
       this.net.bytes += data.length;
@@ -105,13 +112,16 @@ async function main() {
   const net = new FakeNet();
   const warns = [];
   const mk = (id, name, dl, direct = true) => {
-    const r = new Relay({ server: SERVER, token: TOKEN, deviceId: id, deviceName: name, downloadDir: dl, publicKey: 'k-' + id, directStallMs: 1500 });
+    const r = new Relay({
+      server: SERVER, token: TOKEN, deviceId: id, deviceName: name, downloadDir: dl,
+      publicKey: 'k-' + id, directStallMs: 1500, receiptFile: path.join(root, id + '-receipts.json'),
+    });
     if (direct) r.setDirect(net.provider(id));
     r.on('warn', (e) => warns.push(e.message));
     return r;
   };
   const A = mk('dev-aaaaaa', '家里Mac', dirs.a);
-  const B = mk('dev-bbbbbb', '办公Win', dirs.b);
+  let B = mk('dev-bbbbbb', '办公Win', dirs.b);
   let C = null;
   const relayItems = () => fs.readdirSync(path.join(dirs.data, 'blobs')).length;
   const listed = (dir) => fs.readdirSync(dir).filter((n) => !n.startsWith('.'));
@@ -275,6 +285,37 @@ async function main() {
       assert.deepEqual(listed(dirs.b), []);
     });
 
+    await step('尾块已写完：慢盘发布超过链路超时仍经直连收到一次', async () => {
+      const name = '发布较慢.bin';
+      const src = path.join(dirs.src, name);
+      await fsp.writeFile(src, crypto.randomBytes(300001));
+      const originalLink = fsp.link, originalTimeout = A.opts.directStallMs;
+      let published = 0;
+      try {
+        A.opts.directStallMs = 300;
+        fsp.link = async (part, dest) => {
+          if (dest === path.join(dirs.b, name)) {
+            published++;
+            await sleep(800);
+          }
+          return originalLink(part, dest);
+        };
+        const got = waitFor(B, 'received', (e) => e.name === name);
+        const out = A.sendPaths([src]);
+        const [incoming] = await got;
+        await settle(A, out);
+        assert.equal(incoming.via, 'direct');
+        assert.equal(out.via, 'direct');
+        assert.equal(out.state, 'done');
+        assert.equal(published, 1);
+        assert.equal(await sha(incoming.paths[0]), await sha(src));
+      } finally {
+        fsp.link = originalLink;
+        A.opts.directStallMs = originalTimeout;
+        await fsp.rm(path.join(dirs.b, name), { force: true });
+      }
+    });
+
     await step('第三台设备离线：在线的直连收到，离线的上线后从中转收到，谁都不重复', async () => {
       // 先让中转认识第三台设备，再让它下线
       C = mk('dev-cccccc', '笔记本', dirs.c, false);
@@ -305,6 +346,78 @@ async function main() {
       assert.deepEqual([...new Set(receipts)].sort(), ['dev-bbbbbb', 'dev-cccccc']);
       assert.equal(relayItems(), 0, '都收完后中转应清空');
     });
+
+    await step('丢失最终 ok 后只接收一次，另行从中转重发同名同大小文件能收到新内容', async () => {
+      const name = '回执测试.bin', src = path.join(dirs.src, name);
+      const received = [];
+      const onReceived = (e) => { if (e.name === name) received.push(e.via); };
+      B.on('received', onReceived);
+      try {
+        for (const version of [1, 2]) {
+          const contents = Buffer.alloc(300 * 1024, version);
+          await fsp.writeFile(src, contents);
+          if (version === 1) net.dropReply = { type: 'ok' };
+          else net.blocked = true;
+          const out = A.sendPaths([src]);
+          await waitFor(A, 'delivered', (r) => r.id === out.remoteId && r.by === B.opts.deviceId);
+          await settle(A, out);
+          assert.equal(out.state, 'done');
+          assert.equal(out.via, 'relay');
+          assert.equal(net.dropReply, null, '应已切断最终回执');
+          assert.deepEqual(received, version === 1 ? ['direct'] : ['direct', 'relay']);
+          const saved = version === 1 ? name : '回执测试 (2).bin';
+          assert.deepEqual(await fsp.readFile(path.join(dirs.b, saved)), contents);
+        }
+        assert.equal(listed(dirs.b).filter((n) => n.startsWith('回执测试')).length, 2);
+      } finally {
+        net.dropReply = null;
+        net.blocked = false;
+        B.off('received', onReceived);
+      }
+    });
+
+    for (const outcome of ['delivered', 'declined']) {
+      const decline = outcome === 'declined';
+      await step(`接收端${decline ? '拒收' : '落盘'}后掉线并重启：恢复原回执，第三台经中转收到`, async () => {
+        const name = '重启-' + outcome + '.bin', src = path.join(dirs.src, name);
+        await fsp.writeFile(src, crypto.randomBytes(400 * 1024));
+        const before = B;
+        const received = [];
+        const onReceived = (e) => { if (e.name === name) received.push(e.via); };
+        const cancel = (e) => {
+          if (e.name !== name || e.dir !== 'in' || e.state !== 'active') return;
+          before.off('entry', cancel);
+          before.cancel(e.id);
+        };
+        before.on('received', onReceived);
+        if (decline) before.on('entry', cancel);
+        try {
+          net.dropReply = { type: decline ? 'cancel' : 'ok', onDrop: () => before.retire() };
+          const gotC = waitFor(C, 'received', (e) => e.name === name);
+          const out = A.sendPaths([src]);
+          const [entryC] = await gotC;
+          await settle(A, out);
+          assert.equal(out.state, 'done');
+          assert.equal(entryC.via, 'relay');
+          assert.equal(await sha(entryC.paths[0]), await sha(src));
+          assert.equal(net.dropReply, null);
+
+          B = mk(before.opts.deviceId, before.opts.deviceName, dirs.b);
+          B.on('received', onReceived);
+          const ack = waitFor(A, outcome, (r) => r.id === out.remoteId && r.by === B.opts.deviceId);
+          B.start();
+          await ack;
+          assert.deepEqual(received, decline ? [] : ['direct']);
+          assert.deepEqual(listed(dirs.b).filter((n) => n.startsWith('重启-' + outcome)), decline ? [] : [name]);
+          if (!decline) assert.equal(await sha(path.join(dirs.b, name)), await sha(src));
+        } finally {
+          net.dropReply = null;
+          before.off('entry', cancel);
+          before.off('received', onReceived);
+          B.off('received', onReceived);
+        }
+      });
+    }
   } finally {
     for (const r of [A, B, C]) if (r) { r.stop(); r._destroyAgents(); }
     const exited = new Promise((resolve) => srv.once('exit', resolve));

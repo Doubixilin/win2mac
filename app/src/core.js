@@ -11,12 +11,14 @@ const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
+const { BatchReceipts } = require('./batch-receipts');
 
 const CHUNK = 8 * 2 ** 20;
 const RETRIES = 6;
 const IDLE_TIMEOUT = 60e3;
 const DIRECT_MIN = 256 * 1024;        // 小于这个大小的直接走中转，省得为一张截图去打洞
 const DIRECT_CHUNK = 64 * 1024;
+const DIRECT_MAX_OFFER = 8 * 2 ** 20; // 与中转的文件清单大小限制一致
 const DIRECT_WINDOW = 24 * 2 ** 20;   // 对方还没确认落盘的数据最多攒这么多
 const DIRECT_ACK = 1 * 2 ** 20;
 const DIRECT_STALL_MS = 30e3;         // 这么久没有进展就认为直连断了
@@ -59,9 +61,9 @@ function topNames(files, dirs) {
   return [...new Set([...files.map((f) => f.rel), ...(dirs || [])].map((rel) => relativeParts(rel)[0]))].map(safeName);
 }
 
-function batchKey(from, files, dirs) {
-  const body = JSON.stringify([files.map((f) => [f.rel, f.size]), dirs || []]);
-  return from + '|' + crypto.createHash('sha1').update(body).digest('hex');
+function receiptKey(item) {
+  return typeof item.from === 'string' && typeof item.batchId === 'string' && /^[A-Za-z0-9_-]{6,40}$/.test(item.batchId)
+    ? JSON.stringify([item.from, item.batchId]) : null;
 }
 
 function nameKey(name) { return name.normalize('NFC').toLowerCase(); }
@@ -91,7 +93,7 @@ async function publishFile(part, dest, overwrite = false) {
   }
 }
 
-async function publishBatch(dir, item, stage, checkActive) {
+async function publishBatch(dir, item, stage, checkActive, commit) {
   const dirs = new Map(), taken = new Map(), tops = new Set(), created = [];
   async function claim(parent, raw, create, isDir) {
     if (!taken.has(parent)) taken.set(parent, new Set());
@@ -111,8 +113,10 @@ async function publishBatch(dir, item, stage, checkActive) {
         throw e;
       }
       used.add(key);
-      const identity = await fsp.lstat(target, { bigint: true });
-      created.push({ target, isDir, identity });
+      // 创建已成功；即使接下来的 lstat 失败，回滚时也必须核对这个目标。
+      const record = { target, isDir, identity: null };
+      created.push(record);
+      record.identity = await fsp.lstat(target, { bigint: true });
       if (parent === dir) tops.add(target);
       return target;
     }
@@ -136,14 +140,24 @@ async function publishBatch(dir, item, stage, checkActive) {
     }
     for (const rel of item.dirs || []) await directory(relativeParts(rel));
     checkActive();
+    commit?.(); // 回执持久化失败也要走下面的同一套发布回滚
     return [...tops];
   } catch (e) {
+    let incomplete = false;
     for (const { target, isDir, identity } of created.reverse()) {
-      // 保留已经替换或编辑过的文件。目录已被外部添加内容时 rmdir 会保留它。
-      const current = await fsp.lstat(target, { bigint: true }).catch(() => null);
-      if (!current || current.dev !== identity.dev || current.ino !== identity.ino) continue;
-      if (!isDir && current.mtimeNs !== identity.mtimeNs) continue;
-      await (isDir ? fsp.rmdir(target) : fsp.unlink(target)).catch(() => {});
+      try {
+        const current = await fsp.lstat(target, { bigint: true });
+        if (!identity || current.dev !== identity.dev || current.ino !== identity.ino ||
+            (!isDir && (current.size !== identity.size || current.mtimeNs !== identity.mtimeNs || current.ctimeNs !== identity.ctimeNs))) {
+          incomplete = true;
+          continue;
+        }
+        // 目录里被外部放入了文件时，rmdir 会保留整个目录。
+        await (isDir ? fsp.rmdir(target) : fsp.unlink(target));
+      } catch (err) { if (err.code !== 'ENOENT') incomplete = true; }
+    }
+    if (incomplete) {
+      throw Object.assign(new Error(`文件发布未能完整回滚，请核对接收目录。原错误：${e.message}`, { cause: e }), { rollbackIncomplete: true });
     }
     throw e;
   }
@@ -163,7 +177,6 @@ class Relay extends EventEmitter {
     // publicKey：本设备的签名公钥，随请求告知中转；role='control' 表示这是控制端连接，只收设备列表和控制应答
     this.opts = { server: '', token: '', deviceId: '', deviceName: '', downloadDir: '', publicKey: '', role: '', directMin: DIRECT_MIN, directStallMs: DIRECT_STALL_MS };
     this.direct = null;             // 直连通道的提供者，见 setDirect
-    this._skip = new Map();         // 中转条目编号 -> 已经直连收过，到了只确认不下载
     this._failedDirect = new Map(); // 直连中断的接收记录，等中转把同一批内容送来时接着用
     this.connected = false;
     this.devices = [];
@@ -178,6 +191,7 @@ class Relay extends EventEmitter {
     this._outQ = Promise.resolve();
     this._agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
     Object.assign(this.opts, opts);
+    this._receipts = new BatchReceipts(this.opts.receiptFile);
     this.opts.server = String(this.opts.server || '').trim().replace(/\/+$/, '');
     this._retired = false;
   }
@@ -333,7 +347,9 @@ class Relay extends EventEmitter {
 
   _listen(gen) {
     return new Promise((resolve, reject) => {
-      const req = this._request('GET', '/api/events' + (this.opts.role ? '?role=' + this.opts.role : ''), { headers: { Accept: 'text/event-stream' } });
+      const headers = { Accept: 'text/event-stream' };
+      if (!this.opts.role && this.opts.receiptFile) headers['X-W2M-Batch-Receipts'] = '1';
+      const req = this._request('GET', '/api/events' + (this.opts.role ? '?role=' + this.opts.role : ''), { headers });
       this._stream = req;
       req.setTimeout(0);
       let watchdog = null;
@@ -384,12 +400,6 @@ class Relay extends EventEmitter {
     } else if (event === 'item') {
       if (this._seen.has(data.id)) return;
       this._seen.add(data.id);
-      if (this._skip.has(data.id)) {
-        const status = this._skip.get(data.id);
-        this._skip.delete(data.id);
-        this._ack(data.id, status);
-        return;
-      }
       this._inQ = this._inQ.then(() => { if (!this._retired) return this._receive(data); }).catch((e) => this.emit('warn', e));
     } else if (event === 'delivered' || event === 'declined') {
       this.emit(event, data);
@@ -462,19 +472,18 @@ class Relay extends EventEmitter {
     this.emit('entry', entry);
 
     // 在线的设备先试直连；没送到的（离线、没打通、旧版本）再走中转
-    const settled = await this._deliverDirect(entry, { files, dirs }, clip);
+    const batchId = crypto.randomBytes(9).toString('base64url');
+    const settled = await this._deliverDirect(entry, { files, dirs }, clip, batchId);
     if (settled.size && this.peers.every((p) => settled.has(p.id))) return this._finish(entry, 'done');
     entry.via = 'relay';
     entry.done = 0;
 
     const created = await this._retry(entry.id, () => this._json('POST', '/api/items', {
-      kind: 'files', clip, dirs, files: files.map((f) => ({ rel: f.rel, size: f.size })),
+      kind: 'files', batchId, clip, dirs, files: files.map((f) => ({ rel: f.rel, size: f.size })),
     }));
     const rid = entry.remoteId = created.id;
     this.emit('entry', entry);
     try {
-      // 已经直连收到的设备不必再从中转收一遍。条目要到 commit 才会推给各设备，所以这里通知来得及。
-      if (settled.size) await this._tellSkip(settled, rid);
       let base = 0;
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
@@ -531,20 +540,19 @@ class Relay extends EventEmitter {
 
   // ---------- 直连：发送 ----------
 
-  /** 逐台试直连。返回 设备编号 -> 'delivered' | 'declined'，没在里面的就是还得走中转的 */
-  async _deliverDirect(entry, scan, clip) {
-    const settled = new Map();
-    if (!this.direct || !this.connected || entry.total < this.opts.directMin) return settled;
-    const targets = this.peers.filter((p) => this.direct.usable(p));
+  /** 逐台试直连，返回已经送达或拒收的设备编号。 */
+  async _deliverDirect(entry, scan, clip, batchId) {
+    const settled = new Set();
+    if (!this.direct || !this.connected || !this.opts.receiptFile || entry.total < this.opts.directMin) return settled;
+    const targets = this.peers.filter((p) => p.batchReceipts === true && this.direct.usable(p));
     if (!targets.length) return settled;
-    const tid = crypto.randomBytes(9).toString('base64url');
-    entry.remoteId = 'p2p-' + tid;
+    entry.remoteId = 'p2p-' + batchId;
     entry.via = 'direct';
     this.emit('entry', entry);
     for (const peer of targets) {
       try {
-        const outcome = await this._sendDirect(entry, peer, scan, clip, tid);
-        settled.set(peer.id, outcome);
+        const outcome = await this._sendDirect(entry, peer, scan, clip, batchId);
+        settled.add(peer.id);
         this.emit(outcome, { id: entry.remoteId, by: peer.id, byName: peer.name });
       } catch (e) {
         this._checkActive(entry.id); // 是用户自己取消的就不再往下走
@@ -558,7 +566,21 @@ class Relay extends EventEmitter {
 
   async _sendDirect(entry, peer, { files, dirs }, clip, tid) {
     this._checkActive(entry.id);
-    const link = await this.direct.open(peer.id);
+    // 用户可能在建连时取消。立即放行发送队列，迟到的通道仅关闭即可。
+    let link;
+    try {
+      link = await new Promise((resolve, reject) => {
+        let canceled = false;
+        this._active.set(entry.id, { destroy: (error) => { canceled = true; reject(error); } });
+        this.direct.open(peer.id).then((opened) => {
+          if (canceled) opened.close(); else resolve(opened);
+        }, reject);
+      });
+      this._checkActive(entry.id);
+    } catch (error) {
+      link?.close();
+      throw error;
+    } finally { this._active.delete(entry.id); }
     const DECLINED = {};
     const st = { accepted: false, acked: 0, result: null, wake: null };
     const poke = () => { const w = st.wake; st.wake = null; w?.(); };
@@ -596,17 +618,33 @@ class Relay extends EventEmitter {
       link.send(data).then(resolve, reject).finally(() => clearTimeout(t));
     });
     try {
-      await push(JSON.stringify({
-        t: 'offer', v: 1, tid, clip: !!clip, createdAt: entry.time, dirs,
+      const maxMessageSize = link.maxMessageSize;
+      const chunkSize = Number.isSafeInteger(maxMessageSize) && maxMessageSize > 0
+        ? Math.min(maxMessageSize, DIRECT_CHUNK) : DIRECT_CHUNK;
+      const offer = JSON.stringify({
+        t: 'offer', v: 1, batchReceipts: true, tid, clip: !!clip, createdAt: entry.time, dirs,
         files: files.map((f) => ({ rel: f.rel, size: f.size })),
-      }));
-      await until(() => st.accepted, stallMs);
+      });
+      const bytes = Buffer.byteLength(offer);
+      if (bytes > DIRECT_MAX_OFFER) throw new Error('直连文件清单过大');
+      if (bytes <= chunkSize) {
+        await push(offer);
+      } else {
+        await push(JSON.stringify({ t: 'offer-start', bytes }));
+        const encoded = Buffer.from(offer);
+        for (let offset = 0; offset < bytes; offset += chunkSize) {
+          this._checkActive(entry.id);
+          await push(encoded.subarray(offset, offset + chunkSize));
+        }
+      }
+      await until(() => st.accepted || st.result?.t === 'ok', stallMs);
+      if (st.result?.t === 'ok') return 'delivered';
       let sent = 0;
       for (const [i, f] of files.entries()) {
         await push(JSON.stringify({ t: 'file', i }));
         let inFile = 0;
         if (f.size) {
-          for await (const chunk of fs.createReadStream(f.abs, { highWaterMark: DIRECT_CHUNK, end: f.size - 1 })) {
+          for await (const chunk of fs.createReadStream(f.abs, { highWaterMark: chunkSize, end: f.size - 1 })) {
             await until(() => sent - st.acked < DIRECT_WINDOW, stallMs);
             await push(chunk);
             sent += chunk.length;
@@ -634,26 +672,20 @@ class Relay extends EventEmitter {
     }
   }
 
-  async _tellSkip(settled, rid) {
-    for (const [peerId, outcome] of settled) {
-      let link;
-      try {
-        link = await this.direct.open(peerId);
-        const ok = new Promise((resolve, reject) => {
-          link.on('message', (m) => { if (m === '{"t":"ok"}') resolve(); });
-          link.on('close', () => reject(new Error('直连中断')));
-          setTimeout(() => reject(new Error('对方没有回应')), 8e3).unref?.();
-        });
-        ok.catch(() => {});
-        await link.send(JSON.stringify({ t: 'skip', rid, as: outcome }));
-        await ok;
-      } catch (e) {
-        this.emit('warn', new Error(`没能告诉对方跳过中转上的重复内容，它可能会收到两份：${e.message}`));
-      } finally { link?.close(); }
+  // ---------- 直连：接收 ----------
+
+  async _publishReceived(dir, item, stage, entry, key) {
+    const check = () => this._checkActive(entry.id);
+    check();
+    this._receipts.save(key, 'publishing');
+    try {
+      return await publishBatch(dir, item, stage, check, () => this._receipts.save(key, 'delivered'));
+    } catch (e) {
+      if (e.rollbackIncomplete) this._canceled.delete(entry.id); // 即使用户发起了取消，也须显示残留文件的错误
+      else this._receipts.save(key, null);
+      throw e;
     }
   }
-
-  // ---------- 直连：接收 ----------
 
   _incomingEntry(item, via) {
     const tops = topNames(item.files, item.dirs);
@@ -676,14 +708,18 @@ class Relay extends EventEmitter {
     }
     const dirs = (Array.isArray(msg.dirs) ? msg.dirs : []).map(cleanRel).filter(Boolean);
     if (!files.length && !dirs.length) throw new Error('直连内容为空');
-    const tid = typeof msg.tid === 'string' && /^[A-Za-z0-9_-]{6,40}$/.test(msg.tid) ? msg.tid : crypto.randomBytes(9).toString('base64url');
+    if (!msg.batchReceipts || !this.connected || !this.opts.receiptFile || !this.peers.some(p => p.id === peerId && p.batchReceipts === true)) {
+      throw new Error('直连批次回执需要双方和中转升级');
+    }
+    const tid = msg.tid;
+    if (typeof tid !== 'string' || !/^[A-Za-z0-9_-]{6,40}$/.test(tid)) throw new Error('直连批次编号无效');
     const fromName = this.devices.find((d) => d.id === peerId)?.name || peerId;
-    return { id: 'p2p-' + tid, from: peerId, fromName, kind: 'files', files, dirs, total, clip: !!msg.clip, createdAt: Number(msg.createdAt) || Date.now() };
+    return { id: 'p2p-' + tid, batchId: tid, from: peerId, fromName, kind: 'files', files, dirs, total, clip: !!msg.clip, createdAt: Number(msg.createdAt) || Date.now() };
   }
 
-  /** 处理对方开过来的一条直连通道：收一批文件，或者一条“跳过中转上那份”的通知 */
+  /** 处理对方开过来的文件接收通道 */
   _acceptDirect(link, peerId) {
-    let ctx = null, finished = false, chain = Promise.resolve();
+    let ctx = null, finished = false, release, chain = Promise.resolve();
     const say = (o) => link.send(JSON.stringify(o)).catch(() => {});
     // 最后一条消息发出后由对方来关；对方没关的话过一会儿自己关
     const hangup = () => { const t = setTimeout(() => link.close(), 5000); t.unref?.(); };
@@ -701,29 +737,52 @@ class Relay extends EventEmitter {
     const abort = async (e) => {
       finished = true;
       clearTimeout(guard);
-      if (!ctx) { link.close(); return; }
+      if (!ctx) {
+        release?.();
+        await say({ t: 'fail', error: e.message });
+        link.close();
+        return;
+      }
       const { entry } = ctx;
       if (this._active.get(entry.id) === ctx.handle) this._active.delete(entry.id);
       await ctx.cur?.fh.close().catch(() => {});
       if (ctx.stage) await fsp.rm(ctx.stage, { recursive: true, force: true }).catch((err) => this.emit('warn', err));
-      const local = !!e?.canceled || this._canceled.has(entry.id);
+      const local = !e?.rollbackIncomplete && (!!e?.canceled || this._canceled.has(entry.id));
+      let receiptError;
+      if (local && !this._retired) {
+        try { this._receipts.decline(ctx.key); }
+        catch (err) { receiptError = err; this.emit('warn', err); }
+      }
       if (e?.remoteCancel) {
         entry.state = 'canceled';
         entry.error = '对方已取消';
         this.emit('entry', entry);
       } else {
-        this._fail(entry, e);
+        if (receiptError) {
+          this._canceled.delete(entry.id);
+          this._fail(entry, new Error('已拒收，未能保存拒收回执：' + receiptError.message));
+        } else this._fail(entry, e);
         // 不是任何一方取消的：发送方多半会改走中转，到时接着用这条记录
-        if (!local && !this._retired) this._failedDirect.set(batchKey(peerId, ctx.item.files, ctx.item.dirs), { entry, at: Date.now() });
+        if (!local && !this._retired) this._failedDirect.set(ctx.key, { entry, at: Date.now() });
       }
+      release?.();
       if (link.closed) return;
-      if (local) await say({ t: 'cancel' });
-      else if (!e?.remoteCancel) await say({ t: 'fail', error: e?.message || '接收失败' });
+      if (!e?.remoteCancel) await say(local ? { t: 'cancel' } : { t: 'fail', error: e.message });
       hangup();
     };
 
+    let manifest;
     const handle = async (m) => {
-      if (Buffer.isBuffer(m)) {
+      const binary = Buffer.isBuffer(m);
+      if (manifest) {
+        if (!binary || !m.length || m.length > manifest.buffer.length - manifest.used) throw new Error('直连文件清单分片无效');
+        m.copy(manifest.buffer, manifest.used);
+        manifest.used += m.length;
+        guard.refresh();
+        if (manifest.used < manifest.buffer.length) return;
+        m = new TextDecoder('utf-8', { fatal: true }).decode(manifest.buffer);
+        manifest = null;
+      } else if (binary) {
         const cur = ctx?.cur;
         if (!cur || cur.got + m.length > cur.size) throw new Error('直连数据和声明的不一致');
         await cur.fh.writeFile(m);
@@ -736,26 +795,32 @@ class Relay extends EventEmitter {
       let msg;
       try { msg = JSON.parse(m); } catch { throw new Error('直连消息格式错误'); }
       if (!ctx) {
-        if (msg.t === 'skip') {
-          if (typeof msg.rid === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(msg.rid)) {
-            if (this._skip.size >= 1000) this._skip.delete(this._skip.keys().next().value);
-            this._skip.set(msg.rid, msg.as === 'declined' ? 'declined' : undefined);
-          }
-          finished = true;
-          clearTimeout(guard);
-          await say({ t: 'ok' });
-          hangup();
+        if (!binary && msg.t === 'offer-start') {
+          if (!Number.isSafeInteger(msg.bytes) || msg.bytes <= 0 || msg.bytes > DIRECT_MAX_OFFER) throw new Error('直连文件清单大小无效');
+          manifest = { buffer: Buffer.allocUnsafe(msg.bytes), used: 0 };
+          guard.refresh();
           return;
         }
         if (msg.t !== 'offer') throw new Error('直连消息顺序不对');
         const item = this._directItem(msg, peerId);
-        ctx = { item, entry: this._incomingEntry(item, 'direct'), stage: null, cur: null, next: 0, written: 0, acked: 0 };
+        const key = receiptKey(item);
+        release = await this._receipts.acquire(key);
+        const prior = this._receipts.outcome(key);
+        if (prior || link.closed || this._retired) {
+          release();
+          finished = true;
+          clearTimeout(guard);
+          if (prior) await say({ t: prior === 'delivered' ? 'ok' : 'cancel' });
+          hangup();
+          return;
+        }
+        ctx = { key, item, dir: this.opts.downloadDir, entry: this._incomingEntry(item, 'direct'), stage: null, cur: null, next: 0, written: 0, acked: 0 };
         ctx.handle = { destroy: (err) => { chain = chain.then(() => (finished ? null : abort(err))); } };
         this._active.set(ctx.entry.id, ctx.handle);
         clearTimeout(guard);
         this.emit('entry', ctx.entry);
-        await fsp.mkdir(this.opts.downloadDir, { recursive: true });
-        ctx.stage = await fsp.mkdtemp(path.join(this.opts.downloadDir, '.win2mac-'));
+        await fsp.mkdir(ctx.dir, { recursive: true });
+        ctx.stage = await fsp.mkdtemp(path.join(ctx.dir, '.win2mac-'));
         await say({ t: 'accept' });
         return;
       }
@@ -770,13 +835,18 @@ class Relay extends EventEmitter {
         if (ctx.next !== ctx.item.files.length) throw new Error('直连文件不完整');
         const { entry, item } = ctx;
         this._checkActive(entry.id);
-        entry.paths = await publishBatch(this.opts.downloadDir, item, ctx.stage, () => this._checkActive(entry.id));
+        // 暂存文件已写完并核对长度。让发送方在慢盘发布期间使用最终确认的等待时限。
+        if (ctx.acked !== ctx.written) {
+          ctx.acked = ctx.written;
+          say({ t: 'ack', n: ctx.written });
+        }
+        entry.paths = await this._publishReceived(ctx.dir, item, ctx.stage, entry, ctx.key);
+        release();
         finished = true;
         if (this._active.get(entry.id) === ctx.handle) this._active.delete(entry.id);
         await fsp.rm(ctx.stage, { recursive: true, force: true }).catch((e) => this.emit('warn', e));
         this._finish(entry, 'done');
         this.emit('received', entry, item);
-        await say({ t: 'ack', n: ctx.written });
         await say({ t: 'ok' });
         hangup();
       } else if (msg.t === 'cancel') {
@@ -800,8 +870,22 @@ class Relay extends EventEmitter {
       await this._ack(item.id);
       return;
     }
-    // 这批内容刚才直连传到一半断了的话，接着用那条记录，界面上不会多出一条失败的
-    const key = batchKey(item.from, item.files, item.dirs);
+    const key = receiptKey(item);
+    const release = key && await this._receipts.acquire(key);
+    try {
+      if (this._retired) return;
+      const status = key && this._receipts.outcome(key);
+      if (status) { await this._ack(item.id, status); return; }
+      await this._receiveFiles(item, key);
+    } catch (e) {
+      this._seen.delete(item.id);
+      this._fail(this._incomingEntry(item, 'relay'), e);
+      this.emit('warn', e);
+    } finally { release?.(); }
+  }
+
+  async _receiveFiles(item, key) {
+    // 只复用同一发送设备、同一批次的直连失败记录。
     const prior = this._failedDirect.get(key);
     this._failedDirect.delete(key);
     for (const [k, v] of this._failedDirect) if (Date.now() - v.at > DIRECT_RESUME_MS) this._failedDirect.delete(k);
@@ -821,13 +905,22 @@ class Relay extends EventEmitter {
         base += f.size;
         this._progress(entry, base);
       }
-      entry.paths = await publishBatch(dir, item, stage, () => this._checkActive(entry.id));
+      entry.paths = await this._publishReceived(dir, item, stage, entry, key);
       this._finish(entry, 'done');
       this.emit('received', entry, item);
       await this._ack(item.id);
     } catch (e) {
       this._fail(entry, e);
-      if (e.canceled && !this._retired) await this._ack(item.id, 'declined');
+      if (e.canceled && !this._retired) {
+        try { this._receipts.decline(key); }
+        catch (err) {
+          this._seen.delete(item.id);
+          this._fail(entry, new Error('已拒收，未能保存拒收回执：' + err.message));
+          this.emit('warn', err);
+          return;
+        }
+        await this._ack(item.id, 'declined');
+      }
       else this._seen.delete(item.id);
     } finally {
       if (stage) await fsp.rm(stage, { recursive: true, force: true }).catch((e) => this.emit('warn', e));
@@ -870,7 +963,7 @@ class Relay extends EventEmitter {
     // 独立路由使旧中转即使不认识拒收，也不会错误地产生已送达回执。
     const action = status === 'declined' ? 'decline' : 'ack';
     try { await this._retry('ack', () => this._json('POST', `/api/items/${rid}/${action}`)); }
-    catch (e) { if (e.status !== 404) this.emit('warn', e); }
+    catch (e) { if (e.status !== 404) { this._seen.delete(rid); this.emit('warn', e); } }
   }
 
   // ---------- 远程控制用的底层通道 ----------
