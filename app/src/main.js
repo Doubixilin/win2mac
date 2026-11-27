@@ -12,6 +12,8 @@ const { fileURLToPath } = require('url');
 const { Relay } = require('./core');
 const { ControlHost, fingerprint } = require('./control');
 const { prepareIdentity } = require('./identity');
+const { DirectHub } = require('./direct');
+const { WebRtcEngine } = require('./p2p');
 
 // AI 客户端正常是用 ELECTRON_RUN_AS_NODE=1 直接跑 mcp.js 的。万一某个客户端不传环境变量，
 // 程序会被当成普通应用启动并带着 mcp.js 这个参数——这时不开窗口、不抢单实例锁，就在主进程里提供 MCP 服务。
@@ -19,6 +21,9 @@ const mcpMode = process.argv.slice(1).some((a) => a === '--mcp' || /[\\/]mcp\.js
 
 // 测试时用独立的数据目录，这样可以同时开多个实例
 if (process.env.W2M_USER_DATA) app.setPath('userData', process.env.W2M_USER_DATA);
+
+// 直连要让对方看到本机在局域网里的真实地址，同一个网络下才能走内网；默认会被换成 .local 名字
+if (!mcpMode) app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
 const isMac = process.platform === 'darwin';
 const ASSETS = path.join(__dirname, '..', 'assets');
@@ -35,6 +40,7 @@ let floatWin = null;
 let tray = null;
 let quitting = false;
 let unseen = 0;
+let p2pEngine = null;
 
 // ---------- 配置与历史 ----------
 
@@ -48,6 +54,8 @@ function defaults() {
     downloadDir: path.join(app.getPath('downloads'), 'Win2Mac'),
     hotkey: 'Ctrl+Alt+S',
     autoCopy: true, notify: true, showFloat: true, openAtLogin: true,
+    // 两台电脑都在线时文件优先直连（不经中转服务器）；stun 留空用内置的公共服务器，可填 ["主机:端口", ...]
+    direct: true, stun: [],
     floatPos: null,
     // 远程控制：本机授权了哪些设备（按设备编号），每项 { name, key, level: 'read' | 'full' }
     controllers: {},
@@ -425,7 +433,7 @@ function applyLoginItem() {
 
 function applyConfig(patch) {
   const before = { ...config };
-  const allowed = ['server', 'token', 'deviceName', 'downloadDir', 'hotkey', 'autoCopy', 'notify', 'showFloat', 'openAtLogin'];
+  const allowed = ['server', 'token', 'deviceName', 'downloadDir', 'hotkey', 'autoCopy', 'notify', 'showFloat', 'openAtLogin', 'direct'];
   for (const k of allowed) if (k in patch) config[k] = patch[k];
   config.server = String(config.server || '').trim().replace(/\/+$/, '');
   config.token = String(config.token || '').trim();
@@ -436,6 +444,7 @@ function applyConfig(patch) {
   if (config.hotkey !== before.hotkey) hotkeyOk = registerHotkey();
   if (config.openAtLogin !== before.openAtLogin) applyLoginItem();
   if (config.showFloat !== before.showFloat) setFloatVisible(config.showFloat);
+  if (before.direct !== false && config.direct === false) relay.direct?.shutdown();
   if (config.server !== before.server || config.token !== before.token) {
     relay.retire();
     setupRelay();
@@ -486,6 +495,14 @@ const controlExtras = {
     return { opened: p };
   },
 };
+
+// 直连的诊断日志：用了哪些地址、为什么没连上。排查“为什么没走直连”时看它。
+function logDirect(line) {
+  console.log('direct:', line);
+  const p = file('direct.log');
+  try { if (fs.statSync(p).size > 512 * 1024) fs.renameSync(p, p + '.old'); } catch {}
+  fs.appendFile(p, `${new Date().toISOString()} ${line}\n`, () => {});
+}
 
 const controlLog = []; // 最近的远程操作，新的在前
 function logControl(act) {
@@ -629,7 +646,22 @@ function setupRelay() {
       }
     });
   }
-  relay.on('warn', (e) => console.error('relay:', e?.message || e));
+  relay.on('warn', (e) => { console.error('relay:', e?.message || e); if (/直连/.test(e?.message || '')) logDirect(e.message); });
+  if (signingKey) {
+    // 信令用设备密钥签名。对方是本机授权过的控制方时，按授权时核对过的那把公钥验，否则按中转转告的公钥验。
+    const hub = new DirectHub({
+      relay, engine: (p2pEngine ||= new WebRtcEngine()),
+      identity: () => ({ deviceId: config.deviceId, privateKey: signingKey }),
+      peerKey: (id) => config.controllers[id]?.key || relay.peers.find((p) => p.id === id)?.key || '',
+      stun: () => config.stun,
+      enabled: () => config.direct !== false,
+    });
+    const nameOf = (id) => relay.peers.find((p) => p.id === id)?.name || id;
+    hub.on('warn', (e) => logDirect(e?.message || String(e)));
+    hub.on('diag', (id, text) => logDirect(`[${nameOf(id)}] ${text}`));
+    hub.on('route', (id, route) => logDirect(`[${nameOf(id)}] ${route ? `已直连（${route === 'lan' ? '局域网' : '公网'}）` : '已断开'}`));
+    relay.setDirect(hub);
+  }
   if (signingKey) new ControlHost({
     relay,
     identity: () => ({ deviceId: config.deviceId, privateKey: signingKey }),

@@ -57,14 +57,15 @@ function statusText(e) {
   if (e.state === 'canceled') return ['err', '已取消'];
   if (e.state === 'active') {
     const pct = e.total ? Math.floor((e.done / e.total) * 100) : 0;
+    if (e.via === 'direct') return ['', `${e.dir === 'out' ? '直连发送中' : '直连接收中'} ${pct}%`];
     return ['', `${e.dir === 'out' ? '上传中' : '接收中'} ${pct}%`];
   }
-  if (e.dir === 'in') return ['ok', '已接收'];
+  if (e.dir === 'in') return ['ok', e.via === 'direct' ? '已接收 · 直连' : '已接收'];
   if (e.receipts?.length) {
     const delivered = e.receipts.filter((r) => r.status === 'delivered').map((r) => r.name);
     const declined = e.receipts.filter((r) => r.status === 'declined').map((r) => r.name);
     const labels = [];
-    if (delivered.length) labels.push('已送达 ' + delivered.join('、'));
+    if (delivered.length) labels.push('已送达 ' + delivered.join('、') + (e.via === 'direct' ? ' · 直连' : ''));
     if (declined.length) labels.push(declined.join('、') + ' 已拒收');
     return [declined.length ? 'err' : 'ok', labels.join('，')];
   }
@@ -200,7 +201,7 @@ $('sendText').addEventListener('click', submitText);
 
 const dlg = $('settings');
 const FIELDS = ['server', 'token', 'deviceName', 'downloadDir', 'hotkey'];
-const CHECKS = ['autoCopy', 'notify', 'showFloat', 'openAtLogin'];
+const CHECKS = ['autoCopy', 'notify', 'showFloat', 'openAtLogin', 'direct'];
 
 function renderDevices() {
   const ul = $('deviceList');
